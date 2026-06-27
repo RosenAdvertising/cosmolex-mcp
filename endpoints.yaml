@@ -1,0 +1,185 @@
+# cosmolex-mcp tool inventory — FROZEN CONTRACT (83 tools, CosmoLex NextGen /api/v2 REST API)
+# Auth bootstrap (browser-style username/password session login, POST /api/ext/auth/token) is client-internal, not a tool.
+tools:
+  # ── AccountsPayableBills ──
+  - name: list_ap_bills
+    read_write: read
+  - name: create_ap_bill
+    read_write: write
+  - name: get_ap_bill
+    read_write: read
+  - name: update_ap_bill
+    read_write: write
+  - name: delete_ap_bill
+    read_write: write
+  # ── AccountsPayablePayments ──
+  - name: get_ap_payment_status
+    read_write: read
+  - name: list_ap_payments
+    read_write: read
+  - name: create_ap_payment
+    read_write: write
+  # ── AccountsPayableVendors ──
+  - name: list_ap_vendors
+    read_write: read
+  - name: create_ap_vendor
+    read_write: write
+  - name: get_ap_vendor
+    read_write: read
+  - name: update_ap_vendor
+    read_write: write
+  # ── Clients ──
+  - name: create_client
+    read_write: write
+  - name: list_clients
+    read_write: read
+  - name: update_client
+    read_write: write
+  - name: get_client
+    read_write: read
+  - name: delete_client
+    read_write: write
+  # ── CodeLookups ──
+  - name: list_task_codes
+    read_write: read
+  - name: list_activity_codes
+    read_write: read
+  - name: list_codes
+    read_write: read
+  # ── Contacts ──
+  - name: create_contact
+    read_write: write
+  - name: list_contacts
+    read_write: read
+  - name: update_contact
+    read_write: write
+  - name: get_contact
+    read_write: read
+  - name: delete_contact
+    read_write: write
+  # ── Documents ──
+  - name: list_documents
+    read_write: read
+  - name: get_document_default_application
+    read_write: read
+  - name: get_document_download_url
+    read_write: read
+  - name: get_document_upload_url
+    read_write: write
+  - name: delete_document
+    read_write: write
+  # ── Expense ──
+  - name: list_expenses
+    read_write: read
+  - name: create_expense
+    read_write: write
+  - name: get_expense
+    read_write: read
+  - name: update_expense
+    read_write: write
+  - name: delete_expense
+    read_write: write
+  # ── Invoices ──
+  - name: list_invoices
+    read_write: read
+  - name: create_invoice
+    read_write: write
+  - name: update_invoice
+    read_write: write
+  - name: get_invoice
+    read_write: read
+  - name: delete_invoice
+    read_write: write
+  - name: approve_invoice
+    read_write: write
+  # ── Lookups ──
+  - name: lookup_clients
+    read_write: read
+  - name: lookup_client_labels
+    read_write: read
+  - name: lookup_matter_labels
+    read_write: read
+  - name: lookup_matter_type_workflow
+    read_write: read
+  - name: lookup_new_contact_form
+    read_write: read
+  - name: lookup_new_matter_definition
+    read_write: read
+  - name: lookup_new_matter_definition_for_matter
+    read_write: read
+  - name: lookup_new_matter_defaults
+    read_write: read
+  - name: lookup_new_matter_ebilling_defaults
+    read_write: read
+  - name: lookup_expense
+    read_write: read
+  - name: lookup_new_expense
+    read_write: read
+  - name: lookup_new_expense_info
+    read_write: read
+  - name: lookup_new_hard_cost_expense
+    read_write: read
+  - name: lookup_invoice_payments
+    read_write: read
+  - name: lookup_invoice
+    read_write: read
+  - name: lookup_new_invoice
+    read_write: read
+  - name: lookup_new_invoice_info
+    read_write: read
+  - name: lookup_new_time_entry
+    read_write: read
+  - name: lookup_new_timesheet_from_grid
+    read_write: read
+  - name: lookup_new_transaction
+    read_write: read
+  # ── Matters ──
+  - name: create_matter
+    read_write: write
+  - name: list_matters
+    read_write: read
+  - name: update_matter
+    read_write: write
+  - name: get_matter
+    read_write: read
+  - name: delete_matter
+    read_write: write
+  # ── Payments ──
+  - name: list_payments
+    read_write: read
+  - name: create_payment
+    read_write: write
+  - name: get_payment_invoice_allocations
+    read_write: read
+  # ── TextShortcuts ──
+  - name: list_text_shortcuts
+    read_write: read
+  - name: get_text_shortcut
+    read_write: read
+  # ── TimeEntries ──
+  - name: list_time_entries
+    read_write: read
+  - name: create_time_entry
+    read_write: write
+  - name: get_time_entry
+    read_write: read
+  - name: update_time_entry
+    read_write: write
+  - name: delete_time_entry
+    read_write: write
+  # ── Timekeepers ──
+  - name: list_users
+    read_write: read
+  - name: get_user
+    read_write: read
+  # ── Transactions ──
+  - name: list_transactions
+    read_write: read
+  - name: create_transaction
+    read_write: write
+  - name: get_transaction
+    read_write: read
+  - name: update_transaction
+    read_write: write
+  - name: delete_transaction
+    read_write: write

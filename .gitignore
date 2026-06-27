@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+
+# Secrets — never commit
+.env
+*.pem
+testenv*
+*.json
+!pyproject.toml
+!renovate.json
+
+# IDE
+.DS_Store
+.vscode/
+.idea/
