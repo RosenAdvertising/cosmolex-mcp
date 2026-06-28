@@ -1,1143 +1,856 @@
 #!/usr/bin/env python3
-"""CosmoLex API client (NextGen).
+"""Cosmolex API client — ProfitSolv LCS ``/v1`` Integration API (scoped OAuth).
 
-Auth: NextGen session login (username + password). NextGen CosmoLex accounts do
-NOT serve the legacy ProfitSolv LCS ``/v1/`` gateway (it empty-200s / 403s and
-returns no real data) — real data comes from the ``/api/v2/`` REST API, reached
-with a browser-style session login rather than an ApiKey/OAuth integration token.
+Auth: a scoped OAuth app (authorization-code grant once, then refresh-token
+forever). There is **no password login**, so the MCP never trips CosmoLex's
+single-session-per-user limit and never logs the user out of their browser.
 
-Login flow (``POST {BASE_URL}/api/ext/auth/token``, grant_type=password):
-  * Prime cookies with ``GET /login``.
-  * POST the password grant with browser headers (User-Agent, X-Requested-With,
-    Referer) — without them CosmoLex falsely returns 401.
-  * The returned ``access_token`` is sent as the ``a_t`` COOKIE (not a Bearer
-    header) on all subsequent ``/api/v2/{resource}`` data calls.
-  * On a 401 (or a 400 wrapping ``{"httpErrorType":401}`` / ``{"login":false}``)
-    the client re-runs the login. Tokens are cached at
-    ``~/.cosmolex-mcp/tokens.json`` (chmod 0600).
+  * One-time consent (browser, at setup): the user authorizes the integration and
+    pastes back the ``code``; ``cosmolex-mcp-setup`` exchanges it for an
+    ``access_token`` + ``refresh_token`` (see :func:`build_authorize_url` /
+    :func:`exchange_code`).
+  * Steady state: this client refreshes its own ``access_token`` with the
+    ``refresh_token`` (which rotates on every use) — headless, no browser, no
+    password. On a ``401`` it refreshes once and retries. If the ``refresh_token``
+    is itself rejected, it raises asking the user to re-run setup (re-consent).
 
-The PUBLIC login client_id ``4bfde53b970545e6b6a2d7f7ab55a957`` is SHARED across
-ProfitSolv NextGen (same constant Rocket Matter uses) — it is not a secret and
-not the portal ``ci-`` integration key (that key mints a token but ``/api/v2``
-rejects it with ``"login":false``).
+Data: ``{method} {API_BASE}/v1/{resource}[/{id}]`` with two headers —
+``X-Api-Key: <app key>`` and ``X-User-Token: <access_token>``. List endpoints
+return a paginated envelope ``{page,pageSize,totalCount,items,totalPages}``
+(``documents`` returns a bare list); detail / create / update / delete use the
+RESTful item route ``/v1/{resource}/{id}``.
 
-Data query syntax for ``GET /api/v2/{resource}``:
-  ``?fields=a,b,c`` (required) and optional ``&active=eq|true`` ``&top=N``
-  ``&skip=N`` ``&sortInfo=field:desc``. To discover valid fields per resource,
-  GET ``/api/v2/resourcedef/{resource}``. An empty list ``[]`` is valid data
-  (the sandbox is a blank account), not a failure. Note ``active`` is a FILTER on
-  CosmoLex (``active=eq|true``), NOT a readable field — do not request it in
-  ``fields``.
+Verified live 2026-06-28 against the CosmoLex sandbox firm 77 (OAuth host
+``sandbox.cosmolex.com``; data host the ProfitSolv Azure app): the refresh-token
+grant mints a fresh ``access_token`` (HTTP 200 — the no-logout property), ``users``
+returns the real record (``totalCount`` 1), ``documents`` returns a real bare list
+(4 rows), and ``matters``/``clients``/``contacts``/``time-entries``/``expense``/
+``invoices``/``payments`` return HTTP 200 with an empty envelope (the sandbox firm
+is otherwise blank). Coverage was confirmed identical to the verified Rocket Matter
+``/v1`` rebuild (the SAME LCS API): ``transactions`` requires ``bankId``/``matterId``
+("bankId is required when matterId is not provided."), ``codes`` requires
+``matterId`` ("matterId is required."), ``text-shortcuts`` exists but this OAuth
+app/user is not authorized (403), and ``banks``/``coa``/``firm``/``timekeepers``
+are absent (404).
 
-READ COVERAGE (all on ``/api/v2``, verified live 2026-06-21): the list reads
-(``list_clients``/``list_matters``/``list_contacts``/``list_time_entries``/
-``list_expenses``/``list_invoices``/``list_payments``/``list_transactions``/
-``list_users``/``list_documents``/``list_ap_bills``/``list_ap_vendors``) plus the
-detail reads (``get_*`` via the FILTER form — NextGen has no path-style
-``/api/v2/{res}/{id}`` route), plus ``get_firm_summary``, ``list_timekeepers``,
-``list_banks``, ``list_chart_of_accounts``, ``get_payment_invoice_allocations``.
+Server-side LIST filters are forwarded ONLY where /v1 honors them — clients
+``name``/``displayName``, matters ``clientId``/``matterName``, time-entries
+``matterId``, transactions/codes ``matterId`` (required); /v1 SILENTLY IGNORES
+filters elsewhere, so those tools are pagination-only and never advertise a filter
+that returns unfiltered data. This filter set and the create→read→update→delete
+round-trips are INHERITED from the Rocket Matter live verification of this same /v1
+API; the blank CosmoLex sandbox firm could not exercise filtered reads or write
+round-trips directly (flagged UNVERIFIED-for-CosmoLex in the rebuild report).
 
-WRITE COVERAGE (re-pointed to the NextGen ``/api/{resource}`` write API): the
-create/update/delete methods for ``client``, ``matter``, ``contact``,
-``timeExpense`` (time entries + expenses), ``invoice``, and ``transaction``,
-plus AP-bill create/update (``accountPayable``) and AP-vendor create/update
-(``payee``), now POST/PUT/PATCH/DELETE ``/api/{resource}`` via
-``_api_post``/``_api_put``/``_api_patch``/``_api_delete``. The ENDPOINT + VERB
-mirror the verified Rocket Matter rebuild, and the request BODY shape was
-CONFIRMED LIVE against the CosmoLex sandbox (2026-06-27, full create/update/delete
-round-trips per resource) — the ``**fields`` passthrough is kept and NO body
-fields are invented.
-
-NOT AVAILABLE ON NEXTGEN ``/api/v2`` (raise a clear ``RuntimeError`` so the tool
-surface still imports and the count holds): the LCS Lookups (``/v1/lookups/...``),
-the UTBMS Codes (``/v1/codes/...``), the Text Shortcuts (``/v1/text-shortcuts``),
-the document write/action methods (``/v1/documents/...`` upload/download/delete),
-``create_payment`` / ``approve_invoice``, and the AP delete + AP payment methods.
-These were the dead ``/v1`` LCS surface; their NextGen equivalents (where they
-exist) need separate supervised live discovery.
+COVERAGE: the LCS ``/v1`` API is narrower than the NextGen ``/api/v2`` set the
+previous CosmoLex build used. Resources it does NOT expose (timekeepers, firm
+summary, banks, chart of accounts, accounts-payable, lookups, document actions,
+tasks, timers, calendar, tags, trust, rates, firm roles, tax/discount, phone
+messages, internal chat, workflow, reports, recurring billing, matter templates,
+court rules) are kept as **fail-loud stubs** via :meth:`_not_in_v1` — they raise a
+clear "not in the LCS /v1 API" error instead of silently returning nothing, pending
+Toby's keep/drop call. See the module ``COVERAGE_DELTA`` list and the wiki page
+``Cosmolex MCP``.
 """
-
-from __future__ import annotations
 
 import json
 import os
 import time
-from datetime import date, timedelta
 from pathlib import Path
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode
 
 import requests
 
 from cosmolex_mcp import credentials
 
 # Resolve credentials through the pluggable store (OS keyring -> env -> .env file).
-# NextGen auth = username + password (the ApiKey/OAuth keys are not used).
+# The LCS /v1 OAuth model needs the app's API key + the OAuth client_id/secret; the
+# user/per-firm access is carried entirely by the cached OAuth tokens.
 credentials.load_into_environ(
     [
-        "COSMOLEX_USERNAME",
-        "COSMOLEX_PASSWORD",
+        "COSMOLEX_API_KEY",
+        "COSMOLEX_CLIENT_ID",
+        "COSMOLEX_CLIENT_SECRET",
         "COSMOLEX_BASE_URL",
+        "COSMOLEX_API_BASE_URL",
+        "COSMOLEX_REDIRECT_URI",
     ]
 )
 
-BASE_URL = (
-    os.environ.get("COSMOLEX_BASE_URL", "").strip().rstrip("/")
-    or "https://sandbox.cosmolex.com"
+# OAuth host — serves the consent (``/OAuth/authorize``) and token
+# (``/api/ext/auth/token``) endpoints. CosmoLex sandbox = sandbox.cosmolex.com;
+# production = law.cosmolex.com. Override with COSMOLEX_BASE_URL.
+OAUTH_BASE = os.environ.get("COSMOLEX_BASE_URL", "https://sandbox.cosmolex.com")
+
+# LCS Integration data host (the ProfitSolv Azure app). This is a DIFFERENT host
+# from the OAuth host — the earlier "/v1 is dead on NextGen CosmoLex" misdiagnosis
+# came from calling /v1 on the cosmolex.com product host (an empty-200 / 403
+# catch-all), instead of this Azure data host. The default is the sandbox host; the
+# production data host is provisioned per-firm and set via COSMOLEX_API_BASE_URL.
+API_BASE = os.environ.get(
+    "COSMOLEX_API_BASE_URL",
+    "https://lcs-developer-api-profi-sandbox-gncndgfccdgxdtff.centralus-01.azurewebsites.net",
 )
 
-# PUBLIC login-page client_id — SHARED across ProfitSolv NextGen (same value
-# Rocket Matter uses). Constant, not a secret; used for the password grant.
-LOGIN_CLIENT_ID = "4bfde53b970545e6b6a2d7f7ab55a957"
+TOKEN_URL = f"{OAUTH_BASE}/api/ext/auth/token"
+AUTHORIZE_URL = f"{OAUTH_BASE}/OAuth/authorize"
 
-# Browser User-Agent — CosmoLex rejects the session login + data calls without
-# browser-style headers (returns a misleading 401).
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+# Registered redirect URI for the OAuth app (the sandbox app registered
+# ``https://localhost:8770/callback``). Setup uses a manual copy-paste of the
+# ``code`` from the address bar: the browser lands on localhost:8770 (which need not
+# be served) and the ``code`` query param is copied back. Override with
+# COSMOLEX_REDIRECT_URI.
+DEFAULT_REDIRECT_URI = os.environ.get(
+    "COSMOLEX_REDIRECT_URI", "https://localhost:8770/callback"
 )
-
-# Token endpoint (form-urlencoded password grant).
-TOKEN_URL = f"{BASE_URL}/api/ext/auth/token"
 
 CONFIG_DIR = Path.home() / ".cosmolex-mcp"
 TOKEN_FILE = CONFIG_DIR / "tokens.json"
 
+# Access tokens live ~30 min (expires_in 1799); refresh this many seconds early.
+_EXPIRY_SKEW = 90
+
+# Per-request timeout (seconds) for data calls — a stalled /v1 call must not hang
+# the MCP tool indefinitely.
+_HTTP_TIMEOUT = 30
+
+# Tools whose capability the LCS /v1 API does not expose (kept as fail-loud stubs).
+# Surfaced for Toby's keep/drop call — NOT silently dropped.
+COVERAGE_DELTA = [
+    "list_timekeepers (billable-time summary)",
+    "get_firm_summary",
+    "list_banks",
+    "list_chart_of_accounts",
+    "generate_invoice / list_billable_items / approve_invoice (the /api/v2 2-step billing flow)",
+    "get_invoice_allocations",
+    "document actions: get_document_default_app / get_document_download_url / "
+    "get_document_upload_url / delete_document (/v1 documents is read-only list)",
+    "Accounts Payable: list/get/create/update/delete bills, AP payments, vendors (11 tools)",
+    "Lookups: all 17 (new-matter/contact/expense/invoice/time/transaction defaults, labels, suggestions)",
+    "Codes: get_task_codes / get_activity_codes split (only the combined get_codes is in /v1)",
+    "Text shortcuts (endpoint exists in /v1 but this OAuth app/user is not authorized -> 403)",
+    "Not in /v1 at all: tasks, timers, calendar, tags, trust, rates, firm roles, "
+    "tax/discount/surcharge/interest, phone messages, internal chat, workflow, "
+    "reports, recurring billing, matter templates, court rules, global search",
+]
+
 
 def _load_tokens() -> dict:
     if TOKEN_FILE.exists():
-        try:
-            with open(TOKEN_FILE) as f:
-                return json.load(f)
-        except (OSError, ValueError):
-            return {}
+        with open(TOKEN_FILE) as f:
+            return json.load(f)
     return {}
 
 
 def _save_tokens(tokens: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        CONFIG_DIR.chmod(0o700)
+    except OSError:
+        pass
     with open(TOKEN_FILE, "w") as f:
         json.dump(tokens, f, indent=2)
     os.chmod(TOKEN_FILE, 0o600)
 
 
+def _token_record(data: dict, prev: dict | None = None) -> dict:
+    """Normalise a token-endpoint response into the cached token record.
+
+    The ``refresh_token`` ROTATES on every refresh, so the new one must be saved or
+    the chain dies; if a response omits it, the previous one is retained.
+    """
+    prev = prev or {}
+    access = data.get("access_token")
+    if not access:
+        raise RuntimeError(f"Token response had no access_token: {str(data)[:200]}")
+    return {
+        "access_token": access,
+        "refresh_token": data.get("refresh_token") or prev.get("refresh_token", ""),
+        "expires_at": time.time() + int(data.get("expires_in", 1799)),
+        "firm_id": data.get("firmId") or prev.get("firm_id"),
+        "user_name": data.get("userName") or prev.get("user_name"),
+    }
+
+
+# ── OAuth setup helpers (used by cosmolex-mcp-setup) ─────────────────────────
+
+
+def build_authorize_url(
+    redirect_uri: str | None = None, client_id: str | None = None
+) -> str:
+    """Build the browser consent URL the user opens to authorize the integration."""
+    client_id = client_id or os.environ.get("COSMOLEX_CLIENT_ID", "")
+    redirect_uri = redirect_uri or DEFAULT_REDIRECT_URI
+    query = urlencode(
+        {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+        }
+    )
+    return f"{AUTHORIZE_URL}?{query}"
+
+
+def exchange_code(
+    code: str,
+    redirect_uri: str | None = None,
+    client_id: str | None = None,
+    client_secret: str | None = None,
+    save: bool = True,
+) -> dict:
+    """Exchange an authorization ``code`` for tokens (one-time, at setup).
+
+    POSTs ``grant_type=authorization_code`` to the token endpoint. The body matches
+    the live-verified recipe (grant_type + client_id + client_secret + code) — the
+    verified exchange did NOT send a ``redirect_uri``, so it is omitted here; the
+    ``redirect_uri`` argument is kept only to build the consent URL. The rotating
+    ``refresh_token`` returned here is what the client then uses to refresh forever
+    without a password login. Returns the cached token record.
+    """
+    client_id = client_id or os.environ.get("COSMOLEX_CLIENT_ID", "")
+    client_secret = client_secret or os.environ.get("COSMOLEX_CLIENT_SECRET", "")
+    if not (client_id and client_secret):
+        raise RuntimeError(
+            "COSMOLEX_CLIENT_ID and COSMOLEX_CLIENT_SECRET are required to "
+            "exchange the authorization code. Run: cosmolex-mcp-setup"
+        )
+    resp = requests.post(
+        TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=30,
+    )
+    if not resp.ok:
+        raise RuntimeError(
+            f"Authorization-code exchange failed ({resp.status_code}): "
+            f"{resp.text[:300]}"
+        )
+    tokens = _token_record(resp.json())
+    if save:
+        _save_tokens(tokens)
+    return tokens
+
+
 class LCSClient:
-    """NextGen CosmoLex client. Session login (username + password) ->
-    ``a_t`` cookie -> ``/api/v2`` REST data calls.
+    """ProfitSolv LCS ``/v1`` Integration API client (scoped OAuth, no password).
+
+    Construction loads the app key + OAuth client credentials and the cached tokens
+    (from ``cosmolex-mcp-setup``). It does not hit the network — the first data
+    call refreshes the access token if the cached one is stale.
     """
 
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": USER_AGENT,
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": f"{BASE_URL}/nxg/",
-                "Accept": "application/json",
-            }
-        )
+        self.session.headers["Accept"] = "application/json"
+        self._api_key = os.environ.get("COSMOLEX_API_KEY", "")
+        self._client_id = os.environ.get("COSMOLEX_CLIENT_ID", "")
+        self._client_secret = os.environ.get("COSMOLEX_CLIENT_SECRET", "")
         self._tokens = _load_tokens()
-        # Log in if there's no cached, unexpired token; otherwise reuse it.
-        if not self._token_valid():
-            self._login()
-        else:
-            self._apply_session_token()
+        if not self._tokens.get("access_token"):
+            raise RuntimeError(
+                "No CosmoLex OAuth tokens found. Run: cosmolex-mcp-setup"
+            )
+        if not self._api_key:
+            raise RuntimeError(
+                "COSMOLEX_API_KEY is not set. Run: cosmolex-mcp-setup"
+            )
 
     # ── Auth ─────────────────────────────────────────────────────────────────
 
     def _token_valid(self) -> bool:
         return bool(self._tokens.get("access_token")) and (
-            time.time() < self._tokens.get("expires_at", 0) - 60
+            time.time() < self._tokens.get("expires_at", 0) - _EXPIRY_SKEW
         )
 
-    def _apply_session_token(self) -> None:
-        """Set the session ``a_t`` cookie from the cached access token.
-
-        Domain is derived from ``BASE_URL`` (not hardcoded) so a
-        ``COSMOLEX_BASE_URL`` override still attaches the cookie — otherwise
-        requests silently drops it and every call 401s.
-        """
-        self.session.cookies.set(
-            "a_t", self._tokens["access_token"], domain=urlparse(BASE_URL).hostname
-        )
-
-    def _login(self) -> None:
-        """Run the NextGen password-grant session login and persist tokens.
-
-        Browser headers (User-Agent on the session + X-Requested-With + Referer)
-        are REQUIRED — without them the grant falsely returns 401.
-        """
-        username = os.environ.get("COSMOLEX_USERNAME", "")
-        password = os.environ.get("COSMOLEX_PASSWORD", "")
-        if not username or not password:
+    def _refresh(self) -> None:
+        """Get a fresh access token via the rotating refresh token (no password)."""
+        refresh_token = self._tokens.get("refresh_token")
+        if not refresh_token:
+            raise RuntimeError("No refresh_token cached. Run: cosmolex-mcp-setup")
+        if not (self._client_id and self._client_secret):
             raise RuntimeError(
-                "COSMOLEX_USERNAME and COSMOLEX_PASSWORD must be set. "
+                "COSMOLEX_CLIENT_ID / COSMOLEX_CLIENT_SECRET not set. "
                 "Run: cosmolex-mcp-setup"
             )
-
-        # Prime cookies.
-        self.session.get(f"{BASE_URL}/login")
-
-        resp = self.session.post(
+        resp = requests.post(
             TOKEN_URL,
             data={
-                "username": username,
-                "password": password,
-                "grant_type": "password",
-                "client_id": LOGIN_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+                "refresh_token": refresh_token,
             },
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": f"{BASE_URL}/login",
-            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=30,
         )
-        if resp.status_code != 200:
+        if not resp.ok:
             raise RuntimeError(
-                f"Login failed ({resp.status_code}): {resp.text[:200]}"
+                f"Token refresh failed ({resp.status_code}): {resp.text[:200]}. "
+                "The refresh token may be revoked — re-run cosmolex-mcp-setup."
             )
-        data = resp.json()
-        token = data.get("access_token", "")
-        if not token:
-            raise RuntimeError("No access_token in login response")
-
-        self._tokens = {
-            "access_token": token,
-            "refresh_token": data.get("refresh_token", ""),
-            "expires_at": time.time() + data.get("expires_in", 17999),
-        }
+        self._tokens = _token_record(resp.json(), self._tokens)
         _save_tokens(self._tokens)
-        self._apply_session_token()
 
-    # ── /api/v2 REST (NextGen) ───────────────────────────────────────────────
+    def _headers(self) -> dict:
+        return {
+            "X-Api-Key": self._api_key,
+            "X-User-Token": self._tokens.get("access_token", ""),
+        }
+
+    # ── HTTP core ────────────────────────────────────────────────────────────
+
+    def _url(self, path: str) -> str:
+        return f"{API_BASE}/v1/{path.lstrip('/')}"
+
+    def _send(
+        self, method: str, path: str, params: dict | None = None, body=None
+    ) -> requests.Response:
+        """One ``/v1`` request with OAuth headers; refresh + retry once on 401.
+
+        Refreshes the access token first if the cached one is stale; on a 401 from
+        the server (token rejected early) it refreshes once and retries. Returns the
+        raw ``Response`` so callers can treat 404 specially (see :meth:`_detail`).
+        """
+        if not self._token_valid():
+            self._refresh()
+        url = self._url(path)
+        resp = self.session.request(
+            method,
+            url,
+            params=params,
+            json=body,
+            headers=self._headers(),
+            timeout=_HTTP_TIMEOUT,
+        )
+        if resp.status_code == 401:
+            self._refresh()
+            resp = self.session.request(
+                method,
+                url,
+                params=params,
+                json=body,
+                headers=self._headers(),
+                timeout=_HTTP_TIMEOUT,
+            )
+        return resp
 
     @staticmethod
-    def _is_unauthorized(resp: requests.Response) -> bool:
-        """True if the response signals an expired/invalid session.
-
-        NextGen does NOT always use HTTP 401: an expired session token returns
-        HTTP 400 with a JSON body ``{"httpErrorType": 401, "login": false, ...}``.
-        Treat both a real 401 and that 400-wrapped-401 as "re-login needed".
-        """
-        if resp.status_code == 401:
-            return True
-        if resp.status_code == 400 and resp.content:
-            try:
-                body = resp.json()
-            except ValueError:
-                return False
-            if isinstance(body, dict) and (
-                body.get("httpErrorType") == 401 or body.get("login") is False
-            ):
-                return True
-        return False
-
-    def _v2_get(self, resource: str, **params) -> list | dict:
-        """GET ``{BASE}/api/v2/{resource}`` with query params; return parsed JSON.
-
-        ``fields`` may be passed as a list or a comma string; it is joined to the
-        ``fields=a,b,c`` form. Other filters (``active``, ``top``, ``skip``,
-        ``sortInfo``, etc.) pass through unchanged. On a 401 the client re-logs in
-        once and retries. An empty list ``[]`` is valid data.
-        """
-        query: dict[str, object] = {}
-        for key, val in params.items():
-            if val is None:
-                continue
-            if key == "fields" and isinstance(val, (list, tuple)):
-                query["fields"] = ",".join(str(f) for f in val)
-            else:
-                query[key] = val
-        url = f"{BASE_URL}/api/v2/{resource}"
-        if query:
-            # Keep the pipe in active=eq|true and the colon in sortInfo intact.
-            url = f"{url}?{urlencode(query, safe='|:,')}"
-
-        resp = self.session.get(url)
-        if self._is_unauthorized(resp):
-            self._login()
-            resp = self.session.get(url)
+    def _json_or_raise(resp: requests.Response):
+        """Parse a JSON body, or raise a loud error on a non-2xx response."""
         if not resp.ok:
-            raise RuntimeError(f"API error {resp.status_code}: {resp.text[:400]}")
+            raise RuntimeError(
+                f"Cosmolex /v1 error {resp.status_code}: {resp.text[:400]}"
+            )
         if not resp.content:
-            return []
+            return {}
         return resp.json()
 
-    def _v2_detail(self, resource: str, id_field: str, record_id, fields) -> dict | None:
-        """Single record from a ``/api/v2`` list endpoint by id filter.
+    # ── Generic resource operations ──────────────────────────────────────────
 
-        NextGen has no path-style detail route (``/api/v2/{res}/{id}`` 404s for
-        every resource); a detail read is a filtered list. On CosmoLex the
-        filterable primary key is ``id`` for EVERY resource we expose a detail read
-        on — the guid-keyed business resources (client/matter/contact/timeExpense/
-        invoice/transaction/payee) filter by their guid ``id``, and the
-        numeric-keyed resources (user/accountPayable) filter by their numeric
-        ``id``. (Verified live 2026-06-21: ``id=eq|{guid}`` is accepted and returns
-        the row; ``identifier=eq|{guid}`` is REJECTED with 409 — ``identifier`` is
-        a human-facing sequence NUMBER, not the primary key. This is the OPPOSITE
-        of Rocket Matter, where ``identifier`` is the detail filter.) Returns the
-        record dict, or ``None`` if not found.
+    def _list(self, resource: str, page: int = 1, page_size: int = 25, **params):
+        """GET a list endpoint -> the paginated envelope (or bare list for documents).
+
+        ``page`` / ``pageSize`` are the live-confirmed pagination params; extra
+        non-None query params (filters) pass through unchanged.
         """
-        result = self._v2_get(resource, fields=fields, **{id_field: f"eq|{record_id}"})
-        if isinstance(result, list):
-            return result[0] if result else None
-        return result
+        query: dict = {"page": page, "pageSize": page_size}
+        query.update({k: v for k, v in params.items() if v is not None})
+        return self._json_or_raise(self._send("GET", resource, params=query))
 
-    # ── Field sets (from /api/v2/resourcedef, verified live 2026-06-21) ───────
-    # ``active`` is a FILTER on CosmoLex, NOT a readable field — never in fields.
+    def _detail(self, resource: str, record_id) -> dict | None:
+        """GET a single record by id via the RESTful item route.
 
-    _CLIENT_FIELDS = [
-        "name", "displayName", "email", "cellPhoneNumber", "workPhoneNumber",
-        "homePhoneNumber", "code", "identifier", "label", "activeLabel",
-        "city", "country", "clientAsEntity", "entityName", "notes",
-    ]
-    _MATTER_FIELDS = [
-        "clientMatterName", "clientName", "clientDisplayName", "clientIdentifier",
-        "clientCode", "billingMethodName", "billingMethod", "dateOpened",
-        "areaOfLawDesc", "className", "active", "clientPortalShareable",
-    ]
-    _CONTACT_FIELDS = [
-        "name", "displayName", "email", "cellPhoneNumber", "homePhoneNumber",
-        "code", "identifier", "contactTypeLabel", "activeLabel", "city",
-        "country", "clientAsEntity", "entityName",
-    ]
-    _TIME_ENTRY_FIELDS = [
-        "identifier", "description", "clientMatterName", "clientName",
-        "billableAmount", "billableTime", "billedHours", "billedMinutes",
-        "billingStatusLabel", "cardStatusLabel", "cardTypeLabel", "invoiced",
-        "invoiceNumber", "invoiceDate", "creationDate", "expenseCode", "hold",
-    ]
-    _EXPENSE_FIELDS = [
-        "identifier", "description", "clientMatterName", "clientName",
-        "billableAmount", "billingStatusLabel", "cardTypeLabel", "expenseCode",
-        "invoiced", "invoiceNumber", "invoiceDate", "creationDate", "hold",
-    ]
-    _INVOICE_FIELDS = [
-        "clientMatterName", "clientName", "clientCode", "clientEmailAddress",
-        "description", "dueDate", "discountAmount", "discountTypeLabel",
-        "financeChargeAmount", "advancedClientCost", "clientPortalShareable",
-        "ebillingEnabled", "extendedClientMatterName",
-    ]
-    _PAYMENT_FIELDS = ["amount", "notes", "paymentDate", "paymentReference", "payorName"]
-    _TRANSACTION_FIELDS = [
-        "identifier", "clientMatterName", "clientName", "clientCode",
-        "clientDisplayName", "bankName", "bankAccountName", "bankAccountNumber",
-        "bankTypeLabel", "clearDate", "cleared", "depositSlipDate",
-        "depositSlipNumber", "isCreditMemo", "isOperatingRetainer",
-    ]
-    _ALLOCATION_FIELDS = [
-        "accountName", "accountNumber", "accountLabel", "allocationTypeLabel",
-        "creditAmount", "debitAmount", "signedAmount", "balance", "entryDate",
-        "entryType", "memo", "payee", "referenceNumber", "journalEntryId",
-        "isHardCost", "isTaxAllocation",
-    ]
-    _DOCUMENT_FIELDS = [
-        "name", "itemType", "size", "modified", "clientPortalShareable",
-        "hasComments",
-    ]
-    _USER_FIELDS = [
-        "userFullName", "emailAddress", "userName", "roleName", "cellNumber",
-        "lastLoginDateTime",
-    ]
-    _FIRM_FIELDS = [
-        "unpaidBalance", "unbilledBalance", "paidAmount", "billedAmount",
-        "overdueInvoices", "overdueInvoicesTotal", "unpaidInvoices",
-        "trustRetainer", "operatingRetainer", "unbilledTimeExpenseCards",
-    ]
-    _TIMEKEEPER_FIELDS = [
-        "name", "emailAddress", "initials", "title", "active", "billableTime",
-        "nonBillableTime", "noChargeTime", "targetHours", "defaultRate",
-        "className", "timeKeeperCode",
-    ]
-    _BANK_FIELDS = [
-        "bankName", "accountName", "accountNumber", "accountLabel", "balance",
-        "bankTypeLabel", "chartOfAccountNumber", "label", "operatingRetainerAmount",
-        "trustRetainerAmount",
-    ]
-    _COA_FIELDS = [
-        "accountNumber", "accountName", "accountLabel", "accountTypeLabel",
-        "accountBalance", "balanceAmount", "description", "statusLabel",
-        "isSubAccount", "systemDefined",
-    ]
-    _AP_BILL_FIELDS = [
-        "date", "dueDate", "amount", "balance", "discount", "financeCharge",
-        "billCreditLabel", "category", "clientName", "clientMatter",
-        "matterName", "matterFileNumber", "memo1", "memo2", "notes",
-        "isCredit", "paid", "hold", "agingDays", "overDueDays",
-    ]
-    _PAYEE_FIELDS = [
-        "payeeName", "identifier", "printAs", "active", "email", "phone", "fax",
-        "address1", "city", "stateShortName", "countryShortName", "taxId",
-        "eligibleFor1099", "contactName", "notes",
-    ]
+        Returns the record dict, or ``None`` if it does not exist. Tolerates a known
+        server quirk where an existing record is occasionally returned with a 404
+        status but a populated record body. The "found" path is strict: only a 2xx,
+        or a 404 whose body looks like a real record (carries ``id``/``name``),
+        counts as found. Any OTHER non-2xx status (401/403/409/5xx) RAISES — an error
+        envelope is never mistaken for a record (which would otherwise let
+        :meth:`_update` merge-and-PUT corrupt data).
+        """
+        resp = self._send("GET", f"{resource}/{record_id}")
+        data = None
+        if resp.content:
+            try:
+                data = resp.json()
+            except ValueError:
+                data = None
+        if resp.ok:
+            return data if isinstance(data, dict) else None
+        if resp.status_code == 404:
+            # 404 + a record-shaped body = the known quirk (found); else not found.
+            if isinstance(data, dict) and (data.get("id") or data.get("name")):
+                return data
+            return None
+        raise RuntimeError(
+            f"Cosmolex /v1 error {resp.status_code}: {resp.text[:400]}"
+        )
 
-    # ── Clients ──────────────────────────────────────────────────────────────
+    def _create(self, resource: str, body: dict) -> dict:
+        """POST to a collection -> the created record (201)."""
+        return self._json_or_raise(self._send("POST", resource, body=body))
 
-    def list_clients(
-        self,
-        page: int = 1,
-        page_size: int = 25,
-        active_only: bool | None = None,
-        display_name: str | None = None,
-        name: str | None = None,
-        email: str | None = None,
-    ) -> list | dict:
-        """List clients via ``/api/v2/client``. ``page_size`` maps to ``top``;
-        ``active_only`` to ``active=eq|true``. (``display_name``/``name``/``email``
-        accepted for API compatibility; the ``/api/v2`` text-search filters differ
-        from the legacy params and are not applied here.)"""
-        params: dict[str, object] = {
-            "fields": self._CLIENT_FIELDS,
-            "top": page_size,
-            "skip": (page - 1) * page_size,
-        }
-        if active_only:
-            params["active"] = "eq|true"
-        return self._v2_get("client", **params)
+    def _update(
+        self, resource: str, record_id, fields: dict, method: str = "PUT"
+    ) -> dict:
+        """Update via full-record merge: GET the record, overlay the caller's
+        changed fields, and send the WHOLE record back.
 
-    def get_client(self, client_id: str) -> dict | None:
-        return self._v2_detail("client", "id", client_id, self._CLIENT_FIELDS)
+        The /v1 update verbs reject a partial body (a partial client PUT returns
+        ``400 "Name cannot be empty"``), so the current record must be merged in.
+        ``method`` is ``PUT`` for most resources, ``PATCH`` for invoices.
+        """
+        current = self._detail(resource, record_id)
+        if current is None:
+            raise RuntimeError(f"{resource} {record_id} not found; cannot update.")
+        merged = {**current, **fields}
+        return self._json_or_raise(
+            self._send(method, f"{resource}/{record_id}", body=merged)
+        )
 
-    def create_client(self, **fields) -> dict:
-        return self._api_post("client", fields)
+    def _delete(self, resource: str, record_id) -> dict:
+        """DELETE a record by id (204 -> ``{"success": True}``)."""
+        resp = self._send("DELETE", f"{resource}/{record_id}")
+        if resp.ok:
+            return {"success": True}
+        raise RuntimeError(
+            f"Cosmolex /v1 error {resp.status_code}: {resp.text[:400]}"
+        )
 
-    def update_client(self, client_id: str, **fields) -> dict:
-        return self._api_put("client", client_id, fields)
+    def _not_in_v1(self, capability: str) -> RuntimeError:
+        """Standard fail-loud error for a capability the LCS /v1 API lacks.
 
-    def delete_client(self, client_id: str) -> dict:
-        return self._api_delete("client", client_id)
+        Never returns a false success — the tool raises so the gap is visible
+        (Rule 12). Kept registered for Toby's keep/drop call; see ``COVERAGE_DELTA``.
+        """
+        return RuntimeError(
+            f"'{capability}' is not available in the ProfitSolv LCS /v1 Integration "
+            "API (the scoped-OAuth data API this MCP uses). It existed on the legacy "
+            "/api/v2 session API, which trips CosmoLex's single-session limit "
+            "and logs the user out — so it was intentionally dropped. This tool fails "
+            "loudly instead of reporting a false success."
+        )
 
-    # ── Matters ──────────────────────────────────────────────────────────────
+    # ═════════════════════════════ Matters ══════════════════════════════════
 
     def list_matters(
         self,
         page: int = 1,
         page_size: int = 25,
-        active_only: bool | None = None,
-        search_text: str | None = None,
         client_id: str | None = None,
-        matter_owner_id: int | None = None,
-        matter_type_id: int | None = None,
-    ) -> list | dict:
-        """List matters via ``/api/v2/matter``. ``page_size`` maps to ``top``;
-        ``active_only`` to ``active=eq|true``. (``search_text``/``client_id``/
-        ``matter_owner_id``/``matter_type_id`` accepted for API compatibility;
-        ``/api/v2`` server-side filters differ and are not applied here.)"""
-        params: dict[str, object] = {
-            "fields": self._MATTER_FIELDS,
-            "top": page_size,
-            "skip": (page - 1) * page_size,
-        }
-        if active_only:
-            params["active"] = "eq|true"
-        return self._v2_get("matter", **params)
+        matter_name: str | None = None,
+    ):
+        """List matters (``GET /v1/matters``) -> paginated envelope.
+
+        ``client_id`` and ``matter_name`` are the ONLY server-side filters /v1 honors
+        for matters (verified live). Other narrowing (active/owner/free-text) is not
+        applied by /v1, so it is not offered here — passing it would be silently
+        ignored and return unfiltered results.
+        """
+        return self._list(
+            "matters",
+            page=page,
+            page_size=page_size,
+            clientId=client_id,
+            matterName=matter_name,
+        )
 
     def get_matter(self, matter_id: str) -> dict | None:
-        return self._v2_detail("matter", "id", matter_id, self._MATTER_FIELDS)
+        return self._detail("matters", matter_id)
 
     def create_matter(self, **fields) -> dict:
-        return self._api_post("matter", fields)
+        return self._create("matters", fields)
 
     def update_matter(self, matter_id: str, **fields) -> dict:
-        return self._api_put("matter", matter_id, fields)
+        return self._update("matters", matter_id, fields)
 
     def delete_matter(self, matter_id: str) -> dict:
-        return self._api_delete("matter", matter_id)
+        return self._delete("matters", matter_id)
 
-    # ── Contacts ─────────────────────────────────────────────────────────────
+    # ═════════════════════════════ Clients ══════════════════════════════════
 
-    def list_contacts(
-        self, page: int = 1, page_size: int = 25, active_only: bool | None = None
-    ) -> list | dict:
-        params: dict[str, object] = {
-            "fields": self._CONTACT_FIELDS,
-            "top": page_size,
-            "skip": (page - 1) * page_size,
-        }
-        if active_only:
-            params["active"] = "eq|true"
-        return self._v2_get("contact", **params)
+    def list_clients(
+        self,
+        page: int = 1,
+        page_size: int = 25,
+        name: str | None = None,
+        display_name: str | None = None,
+    ):
+        """List clients (``GET /v1/clients``) -> paginated envelope.
+
+        ``name`` and ``display_name`` are the ONLY server-side filters /v1 honors for
+        clients (verified live); other params (active, free-text search) are silently
+        ignored by /v1 and so are not offered here.
+        """
+        return self._list(
+            "clients",
+            page=page,
+            page_size=page_size,
+            name=name,
+            displayName=display_name,
+        )
+
+    def get_client(self, client_id: str) -> dict | None:
+        return self._detail("clients", client_id)
+
+    def create_client(self, **fields) -> dict:
+        """Create a client (``POST /v1/clients``). Only ``name`` is required
+        (verified live); other fields match the read shape."""
+        return self._create("clients", fields)
+
+    def update_client(self, client_id: str, **fields) -> dict:
+        return self._update("clients", client_id, fields)
+
+    def delete_client(self, client_id: str) -> dict:
+        return self._delete("clients", client_id)
+
+    # ═════════════════════════════ Contacts ═════════════════════════════════
+
+    def list_contacts(self, page: int = 1, page_size: int = 25):
+        """List contacts (``GET /v1/contacts``) -> paginated envelope."""
+        return self._list("contacts", page=page, page_size=page_size)
 
     def get_contact(self, contact_id: str) -> dict | None:
-        return self._v2_detail("contact", "id", contact_id, self._CONTACT_FIELDS)
+        return self._detail("contacts", contact_id)
 
     def create_contact(self, **fields) -> dict:
-        return self._api_post("contact", fields)
+        return self._create("contacts", fields)
 
     def update_contact(self, contact_id: str, **fields) -> dict:
-        return self._api_put("contact", contact_id, fields)
+        return self._update("contacts", contact_id, fields)
 
     def delete_contact(self, contact_id: str) -> dict:
-        return self._api_delete("contact", contact_id)
+        return self._delete("contacts", contact_id)
 
-    # ── Time Entries (timeExpense filtered to Time rows) ─────────────────────
+    # ════════════════════════════ Time Entries ══════════════════════════════
 
     def list_time_entries(
         self,
         matter_id: str | None = None,
-        rate_type: str | None = None,
-        billing_status: str | None = None,
-        card_status: str | None = None,
-        timekeeper_id: int | None = None,
         page: int = 1,
         page_size: int = 25,
-    ) -> list | dict:
-        params: dict[str, object] = {
-            "fields": self._TIME_ENTRY_FIELDS,
-            "top": page_size,
-            "skip": (page - 1) * page_size,
-            "sortInfo": "creationDate:desc",
-            "cardTypeLabel": "eq|Time",
-        }
-        return self._v2_get("timeExpense", **params)
+    ):
+        """List time entries (``GET /v1/time-entries``) -> paginated envelope.
+
+        ``matter_id`` is the only server-side filter /v1 honors here (verified live).
+        Other narrowing (rate type, billing status, card status) is NOT applied by
+        /v1, so it is not offered — it would be silently ignored.
+        """
+        return self._list(
+            "time-entries", page=page, page_size=page_size, matterId=matter_id
+        )
 
     def get_time_entry(self, time_entry_id: str) -> dict | None:
-        return self._v2_detail(
-            "timeExpense", "id", time_entry_id, self._TIME_ENTRY_FIELDS
-        )
+        return self._detail("time-entries", time_entry_id)
 
     def create_time_entry(self, **fields) -> dict:
-        return self._api_post("timeExpense", fields)
+        return self._create("time-entries", fields)
 
     def update_time_entry(self, time_entry_id: str, **fields) -> dict:
-        return self._api_put("timeExpense", time_entry_id, fields)
+        return self._update("time-entries", time_entry_id, fields)
 
     def delete_time_entry(self, time_entry_id: str) -> dict:
-        return self._api_delete("timeExpense", time_entry_id)
+        return self._delete("time-entries", time_entry_id)
 
-    # ── Expenses (timeExpense filtered to Expense rows) ──────────────────────
+    # ═════════════════════════════ Expenses ═════════════════════════════════
+    # Note the SINGULAR /v1 path: ``/v1/expense`` (plural ``/v1/expenses`` 404s).
 
-    def list_expenses(
-        self,
-        billing_type_id: int | None = None,
-        billing_status_id: int | None = None,
-        is_matter_active: bool | None = None,
-        page: int = 1,
-        page_size: int = 25,
-    ) -> list | dict:
-        return self._v2_get(
-            "timeExpense",
-            fields=self._EXPENSE_FIELDS,
-            top=page_size,
-            skip=(page - 1) * page_size,
-            sortInfo="creationDate:desc",
-            cardTypeLabel="eq|Expense",
-        )
+    def list_expenses(self, page: int = 1, page_size: int = 25):
+        """List expense cards (``GET /v1/expense``) -> paginated envelope.
 
-    def get_expense(self, expense_card_id: str) -> dict | None:
-        return self._v2_detail(
-            "timeExpense", "id", expense_card_id, self._EXPENSE_FIELDS
-        )
+        /v1 honors NO server-side filters on expense — even ``matterId`` is silently
+        ignored (verified live: it returns the full firm-wide list), unlike
+        time-entries. So no filter is offered; this is a firm-wide expense list.
+        """
+        return self._list("expense", page=page, page_size=page_size)
+
+    def get_expense(self, expense_id: str) -> dict | None:
+        return self._detail("expense", expense_id)
 
     def create_expense(self, **fields) -> dict:
-        return self._api_post("timeExpense", fields)
+        return self._create("expense", fields)
 
-    def update_expense(self, expense_card_id: str, **fields) -> dict:
-        return self._api_put("timeExpense", expense_card_id, fields)
+    def update_expense(self, expense_id: str, **fields) -> dict:
+        return self._update("expense", expense_id, fields)
 
-    def delete_expense(self, expense_card_id: str) -> dict:
-        return self._api_delete("timeExpense", expense_card_id)
+    def delete_expense(self, expense_id: str) -> dict:
+        return self._delete("expense", expense_id)
 
-    # ── Invoices ─────────────────────────────────────────────────────────────
+    # ═════════════════════════════ Invoices ═════════════════════════════════
+    # Update verb is PATCH (not PUT) for invoices, per the live OPTIONS probe.
 
-    def list_invoices(
-        self,
-        page: int = 1,
-        page_size: int = 25,
-        status: str | None = None,
-        matter_id: str | None = None,
-        client_id: str | None = None,
-        invoice_number: str | None = None,
-        is_draft: bool | None = None,
-    ) -> list | dict:
-        return self._v2_get(
-            "invoice",
-            fields=self._INVOICE_FIELDS,
-            top=page_size,
-            skip=(page - 1) * page_size,
-        )
+    def list_invoices(self, page: int = 1, page_size: int = 25):
+        """List invoices (``GET /v1/invoices``) -> paginated envelope."""
+        return self._list("invoices", page=page, page_size=page_size)
 
     def get_invoice(self, invoice_id: str) -> dict | None:
-        return self._v2_detail("invoice", "id", invoice_id, self._INVOICE_FIELDS)
+        return self._detail("invoices", invoice_id)
 
     def create_invoice(self, **fields) -> dict:
-        return self._api_post("invoice", fields)
+        """Create an invoice (``POST /v1/invoices``). The required body has not been
+        exercised live (the dev firm has no billable items); the caller supplies the
+        fields and the API's 400 validation names any that are missing."""
+        return self._create("invoices", fields)
 
     def update_invoice(self, invoice_id: str, **fields) -> dict:
-        return self._api_patch("invoice", invoice_id, fields)
+        return self._update("invoices", invoice_id, fields, method="PATCH")
 
     def delete_invoice(self, invoice_id: str) -> dict:
-        return self._api_delete("invoice", invoice_id)
+        return self._delete("invoices", invoice_id)
 
-    def approve_invoice(self, invoice_id: str, **fields) -> dict:
-        """Approve an invoice. NOT available on NextGen ``/api/v2`` — the legacy
-        ``/v1/invoices/{id}/approve`` LCS path is dead on NextGen accounts and the
-        NextGen approval flow has not been captured live."""
-        raise RuntimeError(
-            "approve_invoice is not available on NextGen /api/v2 (legacy /v1 "
-            "approve path is dead); the NextGen approval flow needs live capture."
+    def generate_invoice(self, *args, **kwargs) -> dict:
+        raise self._not_in_v1(
+            "generate_invoice (the /api/v2 two-step billable-items + challenge-token "
+            "flow). Use create_invoice with the /v1 invoice body instead."
         )
 
-    # ── Payments (genericPayment read; create not on /api/v2) ────────────────
-
-    def list_payments(
-        self,
-        page: int = 1,
-        page_size: int = 25,
-        matter_id: str | None = None,
-        invoice_id: str | None = None,
-        start_date: str | None = None,
-        end_date: str | None = None,
-    ) -> list | dict:
-        # /api/v2 payments resource is genericPayment (NOT payment).
-        return self._v2_get(
-            "genericPayment",
-            fields=self._PAYMENT_FIELDS,
-            top=page_size,
-            skip=(page - 1) * page_size,
-            sortInfo="paymentDate:desc",
+    def list_billable_items(self, *args, **kwargs) -> dict:
+        raise self._not_in_v1(
+            "list_billable_items (the /api/v2 challenge-token preview)"
         )
+
+    def approve_invoice(self, *args, **kwargs) -> dict:
+        raise self._not_in_v1("approve_invoice")
+
+    # ═════════════════════════════ Payments ═════════════════════════════════
+    # /v1/payments supports GET (list) + POST (create); no item detail route.
+
+    def list_payments(self, page: int = 1, page_size: int = 25):
+        """List payments (``GET /v1/payments``) -> paginated envelope."""
+        return self._list("payments", page=page, page_size=page_size)
 
     def create_payment(self, **fields) -> dict:
-        """Record a payment. NOT available on NextGen ``/api/v2`` — the legacy
-        ``/v1/payments`` LCS path is dead on NextGen and the NextGen payment-create
-        flow (a multi-step allocation form) needs separate live capture."""
-        raise RuntimeError(
-            "create_payment is not available on NextGen /api/v2 (legacy /v1 path "
-            "is dead); the NextGen payment-create flow needs live capture."
-        )
+        """Record a payment (``POST /v1/payments``). Body is caller-supplied; the
+        API names any missing required fields via a 400 validation error."""
+        return self._create("payments", fields)
 
-    def get_payment_invoice_allocations(self, **params) -> list | dict:
-        """Invoice allocations via ``/api/v2/allocation``. Requires an
-        ``invoice_id`` / ``invoiceId`` (or ``journal_entry_id``) filter — an
-        unfiltered allocation read 409s ("Something went wrong.")."""
-        invoice_id = params.get("invoice_id") or params.get("invoiceId")
-        journal_entry_id = params.get("journal_entry_id") or params.get("journalEntryId")
-        if not (invoice_id or journal_entry_id):
-            raise RuntimeError(
-                "get_payment_invoice_allocations requires an invoice_id (or "
-                "journal_entry_id) filter; an unfiltered /api/v2/allocation read "
-                "is rejected (409) by NextGen."
-            )
-        q: dict[str, object] = {
-            "fields": self._ALLOCATION_FIELDS,
-            "sortInfo": "entryDate:desc",
-        }
-        if invoice_id:
-            q["invoiceId"] = f"eq|{invoice_id}"
-        if journal_entry_id:
-            q["journalEntryId"] = f"eq|{journal_entry_id}"
-        if params.get("top") is not None:
-            q["top"] = params["top"]
-        if params.get("skip") is not None:
-            q["skip"] = params["skip"]
-        return self._v2_get("allocation", **q)
+    def get_invoice_allocations(self, *args, **kwargs) -> dict:
+        raise self._not_in_v1("get_invoice_allocations")
 
-    # ── Transactions ─────────────────────────────────────────────────────────
+    # ═══════════════════════════ Transactions ═══════════════════════════════
 
     def list_transactions(
         self,
+        matter_id: str | None = None,
+        bank_id: str | None = None,
         page: int = 1,
         page_size: int = 25,
-        bank_id: str | None = None,
-        bank_type: int | None = None,
-        matter_id: str | None = None,
-        transaction_type: str | None = None,
-        transaction_status: str | None = None,
-    ) -> list | dict:
-        params: dict[str, object] = {
-            "fields": self._TRANSACTION_FIELDS,
-            "top": page_size,
-            "skip": (page - 1) * page_size,
-        }
-        if bank_id:
-            params["bankId"] = f"eq|{bank_id}"
-        if matter_id:
-            params["matterId"] = f"eq|{matter_id}"
-        return self._v2_get("transaction", **params)
+    ):
+        """List bank transactions (``GET /v1/transactions``).
+
+        The /v1 transactions endpoint has NO firm-wide listing — it requires a
+        ``matter_id`` or a ``bank_id`` (``bankId is required when matterId is not
+        provided``). The /v1 API exposes no bank-enumeration endpoint, so a
+        ``bank_id`` must come from the CosmoLex UI.
+        """
+        if not (matter_id or bank_id):
+            raise RuntimeError(
+                "list_transactions requires matter_id or bank_id — the LCS /v1 "
+                "transactions endpoint has no firm-wide listing, and /v1 exposes no "
+                "bank-enumeration endpoint (get a bankId from the CosmoLex UI)."
+            )
+        return self._list(
+            "transactions",
+            page=page,
+            page_size=page_size,
+            matterId=matter_id,
+            bankId=bank_id,
+        )
 
     def get_transaction(self, transaction_id: str) -> dict | None:
-        return self._v2_detail(
-            "transaction", "id", transaction_id, self._TRANSACTION_FIELDS
-        )
-
-    @staticmethod
-    def _shape_allocation(alloc: dict, row_id: int) -> dict:
-        """Coerce one transaction allocation row into the shape NextGen requires.
-
-        Verified live 2026-06-21 (mirrors Rocket Matter): the per-row amount key is
-        ``allocationSignedAmount`` (NOT ``signedAmount``/``amount``), each row needs
-        a client-side sequential ``id`` + ``deleted: false``, and
-        ``chartOfAccountId`` is sent as a STRING. ``amount`` is accepted as a
-        friendly alias for ``allocationSignedAmount``.
-        """
-        a = dict(alloc)
-        a.setdefault("id", row_id)
-        a.setdefault("deleted", False)
-        a.setdefault("memo", "")
-        alias = a.pop("amount", None)
-        if "allocationSignedAmount" not in a and alias is not None:
-            a["allocationSignedAmount"] = alias
-        if a.get("chartOfAccountId") is not None:
-            a["chartOfAccountId"] = str(a["chartOfAccountId"])
-        return a
+        return self._detail("transactions", transaction_id)
 
     def create_transaction(self, **fields) -> dict:
-        """Create a bank transaction (deposit/withdrawal) — verified live 2026-06-21.
-
-        Required body: ``bankId`` (guid from :meth:`list_banks`), ``transactionType``
-        ("1"=Deposit / "9"=Withdrawal), ``transactionMethod`` (numeric, 1001+ range;
-        e.g. 1005=Cash — 1-3 are rejected), ``transactionDate``, ``amount`` (string),
-        ``payeeName``, and a non-empty ``allocations`` list whose
-        ``allocationSignedAmount`` values sum to ``amount`` (each needs a
-        ``chartOfAccountId`` from :meth:`list_chart_of_accounts`). Allocation rows are
-        normalised here (see :meth:`_shape_allocation`). NOTE: an Operating-bank
-        deposit needs no matter; a TRUST-bank transaction requires ``matterId``
-        ("Matter is required for trust transaction").
-        """
-        body = dict(fields)
-        body.setdefault("savePayee", False)
-        allocations = body.get("allocations")
-        if isinstance(allocations, list):
-            body["allocations"] = [
-                self._shape_allocation(a, i) for i, a in enumerate(allocations, 1)
-            ]
-        return self._api_post("transaction", body)
+        """Create a bank transaction (``POST /v1/transactions``). Body caller-supplied
+        (needs a ``bankId`` — see :meth:`list_transactions` on bank enumeration)."""
+        return self._create("transactions", fields)
 
     def update_transaction(self, transaction_id: str, **fields) -> dict:
-        return self._api_put("transaction", transaction_id, fields)
+        return self._update("transactions", transaction_id, fields)
 
     def delete_transaction(self, transaction_id: str) -> dict:
-        return self._api_delete("transaction", transaction_id)
+        return self._delete("transactions", transaction_id)
 
-    def list_billable_items(self, matter_id: str, to_date: str | None = None) -> list:
-        """Unbilled, billable time/expense for a matter (``GET /api/timeexpense/``).
+    def list_banks(self, *args, **kwargs) -> dict:
+        raise self._not_in_v1("list_banks (bank enumeration)")
 
-        Each row carries the per-item ``challenge`` token an invoice create must echo
-        back in ``timeExpenseList`` (verified live 2026-06-21). Note the lowercase
-        ``timeexpense`` path — distinct from the ``/api/v2/timeExpense`` read grid,
-        which does not expose ``challenge``.
+    def list_chart_of_accounts(self, *args, **kwargs) -> dict:
+        raise self._not_in_v1("list_chart_of_accounts")
+
+    # ═════════════════════════════ Documents ════════════════════════════════
+    # /v1/documents is read-only (GET list, bare array; no item route).
+
+    def list_documents(self, page: int = 1, page_size: int = 25):
+        """List documents (``GET /v1/documents``) -> a list (firm-wide).
+
+        /v1 documents is read-only and exposes no confirmed server-side filter (the
+        endpoint returned an unfiltered list in testing), so no ``matter_id`` filter
+        is offered — it would be silently ignored.
         """
-        params = {
-            "sortBy": "-creationDate",
-            "matterId": matter_id,
-            "invoiced": "false",
-            "toDate": to_date or date.today().isoformat(),
-            "statusId": "eq|1",
-            "billingStatus": "any|1",
-            "isMatterActive": "eq|true",
-        }
-        resp = self.session.get(f"{BASE_URL}/api/timeexpense/", params=params)
-        if self._is_unauthorized(resp):
-            self._login()
-            resp = self.session.get(f"{BASE_URL}/api/timeexpense/", params=params)
-        if not resp.ok:
-            raise RuntimeError(f"API error {resp.status_code}: {resp.text[:400]}")
-        data = resp.json() if resp.content else []
-        if not isinstance(data, list):
-            raise RuntimeError(
-                f"Unexpected billable-items response: {type(data).__name__}: {str(data)[:200]}"
-            )
-        return data
+        return self._list("documents", page=page, page_size=page_size)
 
-    def generate_invoice(
-        self,
-        matter_id: str,
-        invoice_date: str | None = None,
-        due_date: str | None = None,
-        to_date: str | None = None,
-        **extra,
-    ) -> dict:
-        """Generate an invoice for a matter from its unbilled billable items.
+    def get_document_default_app(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_document_default_app")
 
-        Two-step flow (verified live 2026-06-21): fetch the matter's billable items
-        to collect each item's ``challenge`` token, then POST the invoice echoing
-        ``timeExpenseList=[{id, challenge}, ...]``. Raises if the matter has no
-        unbilled billable items. ``**extra`` overrides any default body field.
+    def get_document_download_url(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_document_download_url")
+
+    def get_document_upload_url(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_document_upload_url")
+
+    def delete_document(self, *a, **k) -> dict:
+        raise self._not_in_v1("delete_document (/v1 documents is read-only)")
+
+    # ═══════════════════════════ Users / Firm ═══════════════════════════════
+    # /v1/users is read-only (GET list + GET detail). Users ARE the firm's
+    # timekeepers (each carries a defaultRate + roles).
+
+    def list_users(self, page: int = 1, page_size: int = 25):
+        """List users / timekeepers (``GET /v1/users``) -> paginated envelope."""
+        return self._list("users", page=page, page_size=page_size)
+
+    def get_user(self, user_id: int) -> dict | None:
+        return self._detail("users", user_id)
+
+    def list_timekeepers(self, *args, **kwargs) -> dict:
+        raise self._not_in_v1(
+            "list_timekeepers (billable-time summary). The people list is in "
+            "list_users; the per-timekeeper billable/non-billable totals are not in /v1."
+        )
+
+    def get_firm_summary(self, *args, **kwargs) -> dict:
+        raise self._not_in_v1("get_firm_summary (firm financial summary)")
+
+    # ═══════════════════════════ Codes (UTBMS) ══════════════════════════════
+
+    def get_codes(self, matter_id: str) -> dict:
+        """UTBMS codes for a matter (``GET /v1/codes?matterId=``). ``matter_id`` is
+        required (the endpoint 400s without it)."""
+        return self._json_or_raise(
+            self._send("GET", "codes", params={"matterId": matter_id})
+        )
+
+    def get_task_codes(self, *args, **kwargs) -> dict:
+        raise self._not_in_v1(
+            "get_task_codes (task/activity split). /v1 exposes only the combined "
+            "get_codes(matter_id)."
+        )
+
+    def get_activity_codes(self, *args, **kwargs) -> dict:
+        raise self._not_in_v1(
+            "get_activity_codes (task/activity split). /v1 exposes only the combined "
+            "get_codes(matter_id)."
+        )
+
+    # ═══════════════════════════ Text Shortcuts ═════════════════════════════
+    # The endpoint exists in /v1 but this OAuth app/user is not authorized (403).
+
+    def list_text_shortcuts(self, page: int = 1, page_size: int = 25):
+        """List text shortcuts (``GET /v1/text-shortcuts``).
+
+        The endpoint exists in /v1 but the scoped OAuth app/user is currently not
+        authorized for it (403). Kept live (not stubbed) so it works automatically
+        if the scope is later granted; raises the API's 403 until then.
         """
-        items = self.list_billable_items(matter_id, to_date)
-        time_expense_list = [
-            {"id": it["id"], "challenge": it["challenge"]}
-            for it in items
-            if it.get("id") and it.get("challenge")
-        ]
-        if not time_expense_list:
-            raise RuntimeError(
-                f"No unbilled billable items for matter {matter_id}; nothing to invoice."
-            )
-        # The next invoice number comes from the matter-scoped form prep; the create
-        # rejects a null invoiceNumber, so fetch it rather than omit it.
-        form = self.session.get(
-            f"{BASE_URL}/api/gui/form/newInvoice", params={"matterId": matter_id}
-        )
-        if self._is_unauthorized(form):
-            self._login()
-            form = self.session.get(
-                f"{BASE_URL}/api/gui/form/newInvoice", params={"matterId": matter_id}
-            )
-        invoice_number = None
-        if form.ok and form.content:
-            try:
-                invoice_number = form.json().get("invoiceNumber")
-            except ValueError:
-                pass
-        inv_date = invoice_date or date.today().isoformat()
-        if due_date is None:
-            due_date = (date.fromisoformat(inv_date) + timedelta(days=30)).isoformat()
-        body = {
-            "matterId": matter_id,
-            "invoiceNumber": invoice_number,
-            "invoiceDate": inv_date,
-            "dueDate": due_date,
-            "toDate": to_date or inv_date,
-            "timeExpenseList": time_expense_list,
-            "description": "",
-            "discountType": "1",
-            "discountAmount": 0,
-            "discountTaxable": True,
-            "consolidateSimilarExpense": True,
-            "overheadContext": 1,
-            "overheadPercentage": 0,
-            "financeChargeAmount": 0,
-            "financeChargeIsAutomatic": False,
-            "lateFees": 0,
-            "otherFees": 0,
-            "clientPortalShareable": False,
-            "showCoverPage": False,
-            "isStartDateSelected": False,
-            "applyAvailableOperatingFunds": False,
-            "applyAvailableTrustFunds": False,
-            "writeOffList": [],
-            "documents": [],
-            "id": None,
-        }
-        body.update(extra)
-        return self._api_post("invoice", body)
-
-    # ── Documents (read on /api/v2; writes not available) ────────────────────
-
-    def list_documents(
-        self,
-        matter_id: str | None = None,
-        path: str | None = None,
-        doc_id: str | None = None,
-        file_name: str | None = None,
-    ) -> list | dict:
-        params: dict[str, object] = {"fields": self._DOCUMENT_FIELDS, "top": 25}
-        if matter_id:
-            params["matterId"] = f"eq|{matter_id}"
-        if doc_id:
-            params["identifier"] = f"eq|{doc_id}"
-        if file_name:
-            params["name"] = f"eq|{file_name}"
-        return self._v2_get("document", **params)
-
-    def get_document_default_application(self) -> dict:
-        raise RuntimeError(
-            "get_document_default_application is not available on NextGen /api/v2 "
-            "(legacy /v1/documents path is dead); needs live capture."
-        )
-
-    def get_document_download_url(self, **fields) -> dict:
-        raise RuntimeError(
-            "get_document_download_url is not available on NextGen /api/v2 "
-            "(legacy /v1/documents path is dead); needs live capture."
-        )
-
-    def get_document_upload_url(self, **fields) -> dict:
-        raise RuntimeError(
-            "get_document_upload_url is not available on NextGen /api/v2 "
-            "(legacy /v1/documents path is dead); needs live capture."
-        )
-
-    def delete_document(self, **fields) -> dict:
-        raise RuntimeError(
-            "delete_document is not available on NextGen /api/v2 "
-            "(legacy /v1/documents path is dead); needs live capture."
-        )
-
-    # ── Users / Timekeepers ──────────────────────────────────────────────────
-
-    def list_users(
-        self, page: int = 1, page_size: int = 25, active_only: bool | None = None
-    ) -> list | dict:
-        """List users via ``/api/v2/user``."""
-        return self._v2_get(
-            "user", fields=self._USER_FIELDS, top=page_size, skip=(page - 1) * page_size
-        )
-
-    def get_user(self, user_id: str) -> dict | None:
-        return self._v2_detail("user", "id", user_id, self._USER_FIELDS)
-
-    def list_timekeepers(
-        self, page: int = 1, page_size: int = 25, active_only: bool | None = None
-    ) -> list | dict:
-        """List timekeepers (billable-time summary) via ``/api/v2/timekeeper``."""
-        params: dict[str, object] = {
-            "fields": self._TIMEKEEPER_FIELDS,
-            "top": page_size,
-        }
-        if active_only:
-            params["active"] = "eq|true"
-        return self._v2_get("timekeeper", **params)
-
-    def get_firm_summary(self) -> list | dict:
-        """Firm financial summary via ``/api/v2/firm``."""
-        return self._v2_get("firm", fields=self._FIRM_FIELDS)
-
-    def list_banks(self) -> list | dict:
-        """Bank accounts via ``/api/v2/bank``. The ``id`` is the ``bankId`` a
-        transaction create needs."""
-        return self._v2_get("bank", fields=self._BANK_FIELDS, top=50)
-
-    def list_chart_of_accounts(self) -> list | dict:
-        """Chart of accounts via ``/api/v2/coa``. The ``id`` is the
-        ``chartOfAccountId`` used in transaction allocations."""
-        return self._v2_get("coa", fields=self._COA_FIELDS, top=300)
-
-    # ── Accounts Payable — Bills (accountPayable grid) ───────────────────────
-
-    def list_ap_bills(
-        self,
-        page: int = 1,
-        page_size: int = 25,
-        status: str | None = None,
-        paid: bool | None = None,
-        is_credit: bool | None = None,
-        payee_name: str | None = None,
-    ) -> list | dict:
-        return self._v2_get(
-            "accountPayable",
-            fields=self._AP_BILL_FIELDS,
-            top=page_size,
-            skip=(page - 1) * page_size,
-        )
-
-    def get_ap_bill(self, bill_id: str) -> dict | None:
-        # accountPayable's primary key is the numeric ``id`` (no ``identifier``).
-        return self._v2_detail("accountPayable", "id", bill_id, self._AP_BILL_FIELDS)
-
-    def create_ap_bill(self, **fields) -> dict:
-        return self._api_post("accountPayable", fields)
-
-    def update_ap_bill(self, bill_id: str, **fields) -> dict:
-        return self._api_patch("accountPayable", bill_id, fields)
-
-    def delete_ap_bill(self, bill_id: str) -> dict:
-        raise RuntimeError(
-            "delete_ap_bill is not available on NextGen /api/v2 (legacy "
-            "/v1/accounts-payable path is dead); the NextGen delete verb needs "
-            "live capture."
-        )
-
-    # ── Accounts Payable — Vendors (payee grid) ──────────────────────────────
-
-    def list_ap_vendors(
-        self,
-        page: int = 1,
-        page_size: int = 25,
-        search: str | None = None,
-        email: str | None = None,
-        active_only: bool | None = None,
-    ) -> list | dict:
-        params: dict[str, object] = {
-            "fields": self._PAYEE_FIELDS,
-            "top": page_size,
-            "skip": (page - 1) * page_size,
-        }
-        if active_only:
-            params["active"] = "eq|true"
-        return self._v2_get("payee", **params)
-
-    def get_ap_vendor(self, vendor_id: str) -> dict | None:
-        return self._v2_detail("payee", "id", vendor_id, self._PAYEE_FIELDS)
-
-    def create_ap_vendor(self, **fields) -> dict:
-        return self._api_post("payee", fields)
-
-    def update_ap_vendor(self, vendor_id: str, **fields) -> dict:
-        return self._api_put("payee", vendor_id, fields)
-
-    # ── Accounts Payable — Payments (not on /api/v2) ─────────────────────────
-
-    def list_ap_payments(self, page: int = 1, page_size: int = 25, **kw) -> dict:
-        raise RuntimeError(
-            "list_ap_payments is not available on NextGen /api/v2 (legacy "
-            "/v1/accounts-payable/payments path is dead); needs live capture."
-        )
-
-    def get_ap_payment_status(self, **params) -> dict:
-        raise RuntimeError(
-            "get_ap_payment_status is not available on NextGen /api/v2 (legacy "
-            "/v1/accounts-payable/payments path is dead); needs live capture."
-        )
-
-    def create_ap_payment(self, **fields) -> dict:
-        raise RuntimeError(
-            "create_ap_payment is not available on NextGen /api/v2 (legacy "
-            "/v1/accounts-payable/payments path is dead); needs live capture."
-        )
-
-    # ── Codes (UTBMS) — not on /api/v2 ───────────────────────────────────────
-
-    def get_codes(self, matter_id: str | None = None) -> dict:
-        raise RuntimeError(
-            "get_codes is not available on NextGen /api/v2 (legacy /v1/codes LCS "
-            "path is dead); the NextGen UTBMS-codes source needs live discovery."
-        )
-
-    def get_task_codes(self, matter_id: str | None = None) -> dict:
-        raise RuntimeError(
-            "get_task_codes is not available on NextGen /api/v2 (legacy /v1/codes "
-            "LCS path is dead); the NextGen UTBMS-codes source needs live discovery."
-        )
-
-    def get_activity_codes(self, matter_id: str | None = None) -> dict:
-        raise RuntimeError(
-            "get_activity_codes is not available on NextGen /api/v2 (legacy "
-            "/v1/codes LCS path is dead); the NextGen UTBMS-codes source needs "
-            "live discovery."
-        )
-
-    # ── Text Shortcuts — not on /api/v2 ──────────────────────────────────────
-
-    def list_text_shortcuts(self, page: int = 1, page_size: int = 25) -> dict:
-        raise RuntimeError(
-            "list_text_shortcuts is not available on NextGen /api/v2 (legacy "
-            "/v1/text-shortcuts LCS path is dead); needs live discovery."
-        )
-
-    def get_text_shortcut(self, shortcut_id: str) -> dict:
-        raise RuntimeError(
-            "get_text_shortcut is not available on NextGen /api/v2 (legacy "
-            "/v1/text-shortcuts LCS path is dead); needs live discovery."
-        )
-
-    # ── Lookups — not on /api/v2 ─────────────────────────────────────────────
-    # The LCS /v1/lookups/* surface is dead on NextGen. NextGen surfaces this data
-    # via /api/gui/form/* and /api/v2/resourcedef/* instead, which need separate
-    # supervised live discovery before re-implementing. Until then these raise.
-
-    def _lookup_unavailable(self, name: str):
-        raise RuntimeError(
-            f"{name} is not available on NextGen /api/v2 (legacy /v1/lookups LCS "
-            "path is dead); NextGen form-defaults come from /api/gui/form/* and "
-            "/api/v2/resourcedef/*, which need live discovery."
-        )
-
-    def lookup_clients(self, query: str | None = None) -> dict:
-        self._lookup_unavailable("lookup_clients")
-
-    def lookup_client_labels(self, query: str | None = None) -> dict:
-        self._lookup_unavailable("lookup_client_labels")
-
-    def lookup_matter_labels(self, query: str | None = None) -> dict:
-        self._lookup_unavailable("lookup_matter_labels")
-
-    def lookup_matter_type_workflow(self, matter_type_id: str) -> dict:
-        self._lookup_unavailable("lookup_matter_type_workflow")
-
-    def lookup_new_contact_form(self) -> dict:
-        self._lookup_unavailable("lookup_new_contact_form")
-
-    def lookup_new_matter_definition(self) -> dict:
-        self._lookup_unavailable("lookup_new_matter_definition")
-
-    def lookup_new_matter_definition_for_matter(self, matter_id: str) -> dict:
-        self._lookup_unavailable("lookup_new_matter_definition_for_matter")
-
-    def lookup_new_matter_defaults(self) -> dict:
-        self._lookup_unavailable("lookup_new_matter_defaults")
-
-    def lookup_new_matter_ebilling_defaults(self) -> dict:
-        self._lookup_unavailable("lookup_new_matter_ebilling_defaults")
-
-    def lookup_expense(self, matter_id: str | None = None) -> dict:
-        self._lookup_unavailable("lookup_expense")
-
-    def lookup_new_expense(self) -> dict:
-        self._lookup_unavailable("lookup_new_expense")
-
-    def lookup_new_expense_info(self, matter_id: str | None = None) -> dict:
-        self._lookup_unavailable("lookup_new_expense_info")
-
-    def lookup_new_hard_cost_expense(self, matter_id: str | None = None) -> dict:
-        self._lookup_unavailable("lookup_new_hard_cost_expense")
-
-    def lookup_invoice_payments(self) -> dict:
-        self._lookup_unavailable("lookup_invoice_payments")
-
-    def lookup_invoice(self, matter_id: str | None = None) -> dict:
-        self._lookup_unavailable("lookup_invoice")
-
-    def lookup_new_invoice(self) -> dict:
-        self._lookup_unavailable("lookup_new_invoice")
-
-    def lookup_new_invoice_info(self, matter_id: str | None = None) -> dict:
-        self._lookup_unavailable("lookup_new_invoice_info")
-
-    def lookup_new_time_entry(self, matter_id: str | None = None) -> dict:
-        self._lookup_unavailable("lookup_new_time_entry")
-
-    def lookup_new_timesheet_from_grid(self) -> dict:
-        self._lookup_unavailable("lookup_new_timesheet_from_grid")
-
-    def lookup_new_transaction(
-        self,
-        transaction_type: str | None = None,
-        context: str | None = None,
-        context_id: str | None = None,
-    ) -> dict:
-        self._lookup_unavailable("lookup_new_transaction")
-
-    # ── /api writes (NextGen) — POST collection / PUT|PATCH|DELETE item ───────
-
-    def _api_post(self, resource: str, body: dict | None = None) -> dict:
-        return self._api_write("POST", f"/api/{resource}", body)
-
-    def _api_put(self, resource: str, record_id, body: dict | None = None) -> dict:
-        """Update via full-record replace (mirrors the verified RM pattern).
-
-        NextGen PUT expects the COMPLETE record, not a partial patch (a partial
-        body returns ``409``). So fetch the current record, merge the caller's
-        changed fields over it, and PUT the whole thing back. BODY shape is
-        CONFIRMED LIVE against the CosmoLex sandbox (2026-06-27).
-        """
-        current = self.session.get(f"{BASE_URL}/api/{resource}/{record_id}")
-        if self._is_unauthorized(current):
-            self._login()
-            current = self.session.get(f"{BASE_URL}/api/{resource}/{record_id}")
-        merged: dict = {}
-        if current.ok and current.content:
-            try:
-                existing = current.json()
-                if isinstance(existing, dict):
-                    merged = existing
-            except ValueError:
-                pass
-        merged.update(body or {})
-        return self._api_write("PUT", f"/api/{resource}/{record_id}", merged)
-
-    def _api_patch(self, resource: str, record_id, body: dict | None = None) -> dict:
-        return self._api_write("PATCH", f"/api/{resource}/{record_id}", body)
-
-    def _api_delete(self, resource: str, record_id) -> dict:
-        return self._api_write("DELETE", f"/api/{resource}/{record_id}", None)
-
-    def _api_write(self, method: str, path: str, body: dict | None) -> dict:
-        """Mutating call on the NextGen /api write API (a_t cookie session).
-
-        Endpoint + verb mirror the verified RM rebuild; the BODY shape is
-        CONFIRMED LIVE against the CosmoLex sandbox (2026-06-27). Re-logs in once
-        on a 401/400-wrapped-401, same as the reads.
-        """
-        url = f"{BASE_URL}{path}"
-        json_body = None if method == "DELETE" else (body or {})
-        resp = self.session.request(method, url, json=json_body)
-        if self._is_unauthorized(resp):
-            self._login()
-            resp = self.session.request(method, url, json=json_body)
-        if not resp.ok:
-            raise RuntimeError(f"API error {resp.status_code}: {resp.text[:400]}")
-        if not resp.content:
-            return {"success": True}
-        return resp.json()
+        return self._list("text-shortcuts", page=page, page_size=page_size)
+
+    def get_text_shortcut(self, shortcut_id: int) -> dict | None:
+        return self._detail("text-shortcuts", shortcut_id)
+
+    # ═══════════════════════════════ Lookups ════════════════════════════════
+    # None of the legacy lookup endpoints exist in the LCS /v1 API (all 404).
+
+    def get_new_matter_defaults(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_new_matter_defaults (lookups)")
+
+    def get_new_matter_definition(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_new_matter_definition (lookups)")
+
+    def get_ebilling_defaults(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_ebilling_defaults (lookups)")
+
+    def get_matter_type_workflow(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_matter_type_workflow (lookups)")
+
+    def get_client_labels(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_client_labels (lookups)")
+
+    def get_matter_labels(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_matter_labels (lookups)")
+
+    def get_client_suggestions(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_client_suggestions (lookups)")
+
+    def get_new_contact_defaults(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_new_contact_defaults (lookups)")
+
+    def get_expense_lookups(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_expense_lookups (lookups)")
+
+    def get_new_expense_lookups(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_new_expense_lookups (lookups)")
+
+    def get_invoice_lookups(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_invoice_lookups (lookups)")
+
+    def get_new_invoice_lookups(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_new_invoice_lookups (lookups)")
+
+    def get_invoice_payment_lookups(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_invoice_payment_lookups (lookups)")
+
+    def get_time_entry_lookups(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_time_entry_lookups (lookups)")
+
+    def get_time_grid_lookups(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_time_grid_lookups (lookups)")
+
+    def get_transaction_lookups(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_transaction_lookups (lookups)")
+
+    def get_hard_cost_expense_lookups(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_hard_cost_expense_lookups (lookups)")
+
+    # ═══════════════════════════ Accounts Payable ═══════════════════════════
+    # No AP endpoints exist in the LCS /v1 API (all 404).
+
+    def list_ap_bills(self, *a, **k) -> dict:
+        raise self._not_in_v1("list_ap_bills (Accounts Payable)")
+
+    def get_ap_bill(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_ap_bill (Accounts Payable)")
+
+    def create_ap_bill(self, *a, **k) -> dict:
+        raise self._not_in_v1("create_ap_bill (Accounts Payable)")
+
+    def update_ap_bill(self, *a, **k) -> dict:
+        raise self._not_in_v1("update_ap_bill (Accounts Payable)")
+
+    def delete_ap_bill(self, *a, **k) -> dict:
+        raise self._not_in_v1("delete_ap_bill (Accounts Payable)")
+
+    def list_ap_payments(self, *a, **k) -> dict:
+        raise self._not_in_v1("list_ap_payments (Accounts Payable)")
+
+    def create_ap_payment(self, *a, **k) -> dict:
+        raise self._not_in_v1("create_ap_payment (Accounts Payable)")
+
+    def get_ap_payment_status(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_ap_payment_status (Accounts Payable)")
+
+    def list_ap_vendors(self, *a, **k) -> dict:
+        raise self._not_in_v1("list_ap_vendors (Accounts Payable)")
+
+    def get_ap_vendor(self, *a, **k) -> dict:
+        raise self._not_in_v1("get_ap_vendor (Accounts Payable)")
+
+    def create_ap_vendor(self, *a, **k) -> dict:
+        raise self._not_in_v1("create_ap_vendor (Accounts Payable)")
+
+    def update_ap_vendor(self, *a, **k) -> dict:
+        raise self._not_in_v1("update_ap_vendor (Accounts Payable)")

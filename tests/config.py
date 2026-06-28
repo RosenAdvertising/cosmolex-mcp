@@ -19,6 +19,6 @@ TOOLKIT = ToolkitConfig(
     resilience=ResilienceConfig(tools_to_timeout_test=["list_clients"]),
     skip_tiers={
         "contract": "endpoints.yaml is a tool inventory, not an OpenAPI doc — contract tier needs OpenAPI 3.x",
-        "smoke": "requires live CosmoLex credentials (COSMOLEX_USERNAME + COSMOLEX_PASSWORD + base URL)",
+        "smoke": "requires live OAuth credentials (run cosmolex-mcp-setup: API key + client_id/secret + one-time consent)",
     },
 )

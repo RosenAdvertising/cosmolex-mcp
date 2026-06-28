@@ -4,42 +4,48 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 MCP server for [CosmoLex](https://www.cosmolex.com) — legal practice management
-for NextGen CosmoLex accounts. Use CosmoLex from Claude Desktop (or any MCP
-client) with natural language: matters, clients, contacts, time entries,
-expenses, invoices, payments, transactions, accounts payable, and documents.
+from Claude Desktop in natural language, over the official **ProfitSolv LCS `/v1`
+Integration API** with a **scoped OAuth** integration.
 
-This server exposes **83 tools** across 16 resource groups, built against the
-NextGen `/api/v2` REST API (the live data API on current CosmoLex accounts),
-reached with a username/password session login.
+No password login: the server authorizes once in the browser, then refreshes its own
+token forever. It never trips CosmoLex's single-session-per-user limit, so it won't
+log you out of your CosmoLex browser session while it runs.
+
+The server exposes **86 MCP tools**. The resources the LCS `/v1` API does not expose
+are kept as **fail-loud stubs** — they return a clear "not in the LCS /v1 API" error
+rather than silently returning nothing, pending a keep/drop decision.
 
 ## What you can do
 
-- **Matters & Clients** — list, get, create, update, delete matters and clients.
-- **Contacts** — full CRUD on matter/client contacts.
-- **Time & Expense** — list, get, create, update, delete time entries and expense cards.
-- **Invoices & Payments** — list/get/create/update/delete invoices, approve invoices,
-  record payments, and inspect invoice payment allocations.
-- **Transactions** — list/get/create/update/delete bank/trust transactions.
-- **Accounts Payable** — manage AP bills, vendors, and payments.
-- **Documents** — list documents, fetch download/upload URLs, delete documents.
-- **Timekeepers (users)** — list and get firm users.
-- **Lookups & Codes** — form/definition lookups and task/activity/code lookups
-  used to build valid create payloads. **Note:** these (and a few write flows —
-  invoice approve, payment create, AP payment/delete, document write) are part of
-  the legacy LCS surface and are **not yet available on NextGen `/api/v2`**; their
-  tools remain in the surface and return an explanatory error until the NextGen
-  equivalents are mapped.
+The LCS `/v1` Integration API covers the core practice-management entities:
 
-Read tools are prefixed `list_*` / `get_*` / `lookup_*`; write tools are
-`create_*` / `update_*` / `delete_*` / `approve_*`. Every write tool's description
-states its side effect explicitly (it permanently changes live firm data).
+- **Matters** — list, get, create, update, delete
+- **Clients & Contacts** — full CRUD
+- **Time entries & Expenses** — full CRUD (log and edit billable time and costs)
+- **Invoices** — list, get, create, update, delete
+- **Payments** — list and record
+- **Transactions** — list (by matter or bank), get, create, update, delete
+- **Documents** — list (read-only)
+- **Users / timekeepers** — list, get
+- **UTBMS codes** — per matter
+
+### Not covered by the `/v1` API
+
+The `/v1` Integration API is narrower than CosmoLex's internal UI (and than the
+NextGen `/api/v2` surface a previous build used). These are **not available** and
+their tools fail loudly (rather than returning nothing): firm financial summary,
+timekeeper time summaries, bank/chart-of-accounts enumeration, the two-step
+invoice-generation flow, accounts payable, lookup/defaults endpoints, and tasks,
+timers, calendar, tags, trust, rates, firm roles, tax/discount, phone messages,
+internal chat, workflow, reports, recurring billing, matter templates, and court
+rules.
 
 ## Requirements
 
 - Python 3.10+
-- A CosmoLex **login** (the username + password you use in the CosmoLex web app)
-- Optionally, a host override (defaults to `https://app.cosmolex.com`; use
-  `https://sandbox.cosmolex.com` for a sandbox/trial account)
+- Claude Desktop (or any MCP-compatible client)
+- A CosmoLex account **and** a registered OAuth integration (API key + OAuth client
+  ID/secret) for the ProfitSolv LCS Integration API
 
 ## Installation
 
@@ -49,86 +55,97 @@ uv pip install -e .
 pip install -e .
 ```
 
-## Authentication
-
-NextGen CosmoLex accounts authenticate with a **browser-style session login** —
-just the CosmoLex username + password you use in the web app. There is no API key
-or OAuth app to register for the working data path.
-
-### How it works
-
-The server runs a password-grant session login (`POST /api/ext/auth/token` with a
-public, shared login client) and sends the returned token as the `a_t` **cookie**
-on every `/api/v2/{resource}` data call. The session token is cached for you (at
-`~/.cosmolex-mcp/tokens.json`, mode 0600) and re-acquired automatically on expiry
-or a 401. No Bearer header, no per-request token minting.
-
-### Environment variables
-
-| Variable             | Required | Purpose                                                                 |
-| -------------------- | -------- | ----------------------------------------------------------------------- |
-| `COSMOLEX_USERNAME`  | yes      | Your CosmoLex login username (email).                                   |
-| `COSMOLEX_PASSWORD`  | yes      | Your CosmoLex login password.                                           |
-| `COSMOLEX_BASE_URL`  | no       | Host root. Defaults to `https://app.cosmolex.com`; use `https://sandbox.cosmolex.com` for a sandbox/trial account. |
-
-See [`.env.example`](.env.example) for a template.
-
 ## Setup
 
 ```bash
 cosmolex-mcp-setup
 ```
 
-This prompts for your CosmoLex username, password, and an optional host override,
-and stores them in your OS keyring (see Credential storage below).
+The wizard:
 
-Verify your configuration and credential backend:
+1. Stores your integration's **API key**, **OAuth client ID**, and **client secret**
+   in your OS keyring (see Credential storage below).
+2. Prints an authorization URL. Open it in your browser (logged in to CosmoLex) and
+   click **Allow**.
+3. Your browser redirects to the app's registered redirect URI
+   (`https://localhost:8770/callback`) with a `?code=...` parameter. The browser may
+   show a connection error — that's fine; just copy the `code` value from the address
+   bar and paste it back into the wizard.
+4. The wizard exchanges the code for an access token + refresh token, cached at
+   `~/.cosmolex-mcp/tokens.json` (chmod 600).
+
+After that, the client refreshes its own access token with the (rotating) refresh
+token — no browser, no password — so you won't be prompted again unless the refresh
+token is revoked.
+
+Verify:
 
 ```bash
 cosmolex-mcp-verify
 ```
 
-## Credential storage
-
-Secrets are stored in your operating system's native secret store via the
-cross-platform [`keyring`](https://github.com/jaraco/keyring) library:
-
-- macOS → Keychain
-- Windows → Credential Manager
-- Linux → Secret Service (GNOME Keyring / KWallet)
-
-Resolution order (read): **OS keyring → process environment →
-`~/.cosmolex-mcp/.env`**. On headless hosts with no Secret Service backend, the
-server falls back to a `chmod 0600` `.env` file in `~/.cosmolex-mcp/`. Opt out of
-keyring with `COSMOLEX_MCP_USE_KEYRING=0`.
-
-## Claude Desktop configuration
-
-Add to your `claude_desktop_config.json`:
+## Claude Desktop Configuration
 
 ```json
 {
   "mcpServers": {
     "cosmolex": {
-      "command": "cosmolex-mcp",
-      "env": {
-        "COSMOLEX_USERNAME": "you@example.com",
-        "COSMOLEX_PASSWORD": "your-password"
-      }
+      "command": "cosmolex-mcp"
     }
   }
 }
 ```
 
-(If you store credentials via `cosmolex-mcp-setup`, you can omit the `env` block.)
+## Credential storage
 
-## Running
+By default credentials are stored in your operating system's native secret store via
+the cross-platform [`keyring`](https://github.com/jaraco/keyring) library:
 
-```bash
-cosmolex-mcp
-```
+| OS      | Backend                                  |
+| ------- | ---------------------------------------- |
+| macOS   | Keychain                                 |
+| Windows | Credential Manager                       |
+| Linux   | Secret Service (GNOME Keyring / KWallet) |
 
-The server speaks MCP over stdio.
+Secrets are saved under the service name `cosmolex-mcp`. Nothing is written to disk in
+clear text.
+
+**File fallback.** On a host with no keyring backend (e.g. a headless Linux box
+without Secret Service), or if you set `COSMOLEX_MCP_USE_KEYRING=0`, credentials fall
+back to a `~/.cosmolex-mcp/.env` file with `0600` permissions.
+
+**Read order.** Credentials resolve in the order OS keyring → process environment →
+`.env` file.
+
+## Authentication notes
+
+The server uses the **ProfitSolv LCS `/v1` Integration API** with a scoped OAuth
+integration:
+
+- **Consent once** (`/OAuth/authorize` → `Allow`) to obtain an authorization code.
+- **Exchange** the code at `{base}/api/ext/auth/token` (`grant_type=authorization_code`)
+  for an `access_token` (~30 min) + a rotating `refresh_token`.
+- **Data calls** go to the LCS `/v1` host with two headers: `X-Api-Key: <app key>` and
+  `X-User-Token: <access token>`.
+- **Refresh** (`grant_type=refresh_token`) renews the access token without a password
+  login, so the user's CosmoLex browser session is never bumped.
+
+Hosts are overridable via `COSMOLEX_BASE_URL` (OAuth host — sandbox
+`sandbox.cosmolex.com`, production `law.cosmolex.com`) and `COSMOLEX_API_BASE_URL`
+(the LCS `/v1` data host — the ProfitSolv Azure app; the production data host is
+provisioned per-firm).
+
+## Example usage in Claude
+
+> "List my matters"
+>
+> "Create a client named Acme Holdings"
+>
+> "Log a time entry on matter <id>"
+>
+> "Show open invoices and recent payments"
+>
+> "List the firm's users"
 
 ## License
 
