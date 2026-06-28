@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cosmolex-mcp"
-version = "0.1.0"
-description = "MCP server for CosmoLex — NextGen /api/v2 legal practice management"
+version = "0.2.0"
+description = "MCP server for CosmoLex — ProfitSolv LCS /v1 Integration API (scoped OAuth)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -14,13 +14,11 @@ dependencies = [
     "mcp>=1.27.2",
     "requests>=2.34.2",
     "keyring>=24.0.0",
-    "pyyaml>=6.0.0",
-    "structlog>=24.1.0",
 ]
 
 [project.scripts]
 cosmolex-mcp = "cosmolex_mcp.server:main"
-cosmolex-mcp-setup = "cosmolex_mcp.setup:main"
+cosmolex-mcp-setup = "cosmolex_mcp.setup.oauth_flow:main"
 cosmolex-mcp-verify = "cosmolex_mcp.setup.verify:main"
 
 [project.urls]
