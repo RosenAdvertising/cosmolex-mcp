@@ -74,7 +74,7 @@ The wizard:
 4. The wizard exchanges the code for an access token + refresh token, cached at
    `~/.cosmolex-mcp/tokens.json` (chmod 600).
 
-After that, the client refreshes its own access token with the (rotating) refresh
+After that, the client refreshes its own access token with the long-lived refresh
 token — no browser, no password — so you won't be prompted again unless the refresh
 token is revoked.
 
@@ -124,7 +124,7 @@ integration:
 
 - **Consent once** (`/OAuth/authorize` → `Allow`) to obtain an authorization code.
 - **Exchange** the code at `{base}/api/ext/auth/token` (`grant_type=authorization_code`)
-  for an `access_token` (~30 min) + a rotating `refresh_token`.
+  for an `access_token` (~30 min) + a long-lived `refresh_token`.
 - **Data calls** go to the LCS `/v1` host with two headers: `X-Api-Key: <app key>` and
   `X-User-Token: <access token>`.
 - **Refresh** (`grant_type=refresh_token`) renews the access token without a password
