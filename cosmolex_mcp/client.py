@@ -96,13 +96,19 @@ API_BASE = os.environ.get(
 TOKEN_URL = f"{OAUTH_BASE}/api/ext/auth/token"
 AUTHORIZE_URL = f"{OAUTH_BASE}/OAuth/authorize"
 
-# Registered redirect URI for the OAuth app (the sandbox app registered
-# ``https://localhost:8770/callback``). Setup uses a manual copy-paste of the
-# ``code`` from the address bar: the browser lands on localhost:8770 (which need not
-# be served) and the ``code`` query param is copied back. Override with
-# COSMOLEX_REDIRECT_URI.
-DEFAULT_REDIRECT_URI = os.environ.get(
-    "COSMOLEX_REDIRECT_URI", "https://localhost:8770/callback"
+# Registered redirect URI for the OAuth app — a hard constant, NOT env-derived, so the
+# setup wizard can detect a stored/overridden redirect that differs from what the app
+# will actually accept (a mismatch breaks consent). The CosmoLex sandbox app registered
+# ``https://localhost:8770/callback``; setup uses a manual copy-paste of the ``code``
+# from the address bar (the browser lands on localhost:8770, which need not be served,
+# and the ``code`` query param is copied back).
+REGISTERED_REDIRECT_URI = "https://localhost:8770/callback"
+
+# Effective redirect for building the consent URL: an explicit COSMOLEX_REDIRECT_URI
+# override wins (for an app that registered a different redirect), else the registered
+# constant above.
+DEFAULT_REDIRECT_URI = (
+    os.environ.get("COSMOLEX_REDIRECT_URI") or REGISTERED_REDIRECT_URI
 )
 
 CONFIG_DIR = Path.home() / ".cosmolex-mcp"

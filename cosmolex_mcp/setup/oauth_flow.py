@@ -25,6 +25,7 @@ from cosmolex_mcp import credentials
 from cosmolex_mcp.client import (
     DEFAULT_REDIRECT_URI,
     OAUTH_BASE,
+    REGISTERED_REDIRECT_URI,
     build_authorize_url,
     exchange_code,
 )
@@ -54,13 +55,14 @@ def main():
     )
 
     # Guard against a stale/wrong stored redirect URI. The OAuth app only accepts its
-    # REGISTERED redirect, so an override that differs from the documented default will
-    # break first-time consent (a bad_request at the authorize step). Warn loudly
-    # rather than silently using the wrong value.
-    if redirect_uri != DEFAULT_REDIRECT_URI:
+    # REGISTERED redirect, so a stored/overridden value that differs from it breaks
+    # first-time consent (a bad_request at the authorize step). Compare against the hard
+    # REGISTERED_REDIRECT_URI constant — NOT DEFAULT_REDIRECT_URI, which is itself
+    # env-derived and would equal a wrong override, making the check dead. Warn loud.
+    if redirect_uri != REGISTERED_REDIRECT_URI:
         print(
             f"\n⚠  COSMOLEX_REDIRECT_URI is set to:\n     {redirect_uri}\n"
-            f"   which differs from the app's registered redirect:\n     {DEFAULT_REDIRECT_URI}\n"
+            f"   which differs from the app's registered redirect:\n     {REGISTERED_REDIRECT_URI}\n"
             "   Consent will FAIL unless that exact URI is registered on the OAuth app.\n"
             "   Unset COSMOLEX_REDIRECT_URI to use the registered default."
         )
