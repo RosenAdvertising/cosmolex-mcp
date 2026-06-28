@@ -2,7 +2,7 @@
 """Setup for cosmolex-mcp — scoped OAuth (ProfitSolv LCS /v1 Integration API).
 
 Stores the app's API key + OAuth client_id/client_secret, then runs the one-time
-authorization-code consent so the MCP gets an access_token + a (rotating)
+authorization-code consent so the MCP gets an access_token + a long-lived
 refresh_token. After this, the client refreshes its own token forever — no password
 login, so it never trips CosmoLex's single-session limit or logs you out.
 
@@ -52,6 +52,18 @@ def main():
     redirect_uri = (
         os.environ.get("COSMOLEX_REDIRECT_URI", "").strip() or DEFAULT_REDIRECT_URI
     )
+
+    # Guard against a stale/wrong stored redirect URI. The OAuth app only accepts its
+    # REGISTERED redirect, so an override that differs from the documented default will
+    # break first-time consent (a bad_request at the authorize step). Warn loudly
+    # rather than silently using the wrong value.
+    if redirect_uri != DEFAULT_REDIRECT_URI:
+        print(
+            f"\n⚠  COSMOLEX_REDIRECT_URI is set to:\n     {redirect_uri}\n"
+            f"   which differs from the app's registered redirect:\n     {DEFAULT_REDIRECT_URI}\n"
+            "   Consent will FAIL unless that exact URI is registered on the OAuth app.\n"
+            "   Unset COSMOLEX_REDIRECT_URI to use the registered default."
+        )
 
     if not (api_key and client_id and client_secret):
         print("Error: API key, client ID, and client secret are all required.")

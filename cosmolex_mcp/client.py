@@ -10,9 +10,10 @@ single-session-per-user limit and never logs the user out of their browser.
     ``access_token`` + ``refresh_token`` (see :func:`build_authorize_url` /
     :func:`exchange_code`).
   * Steady state: this client refreshes its own ``access_token`` with the
-    ``refresh_token`` (which rotates on every use) — headless, no browser, no
-    password. On a ``401`` it refreshes once and retries. If the ``refresh_token``
-    is itself rejected, it raises asking the user to re-run setup (re-consent).
+    ``refresh_token`` (a long-lived, static token, re-saved if the server ever
+    rotates it) — headless, no browser, no password. On a ``401`` it refreshes once
+    and retries. If the ``refresh_token`` is itself rejected, it raises asking the
+    user to re-run setup (re-consent).
 
 Data: ``{method} {API_BASE}/v1/{resource}[/{id}]`` with two headers —
 ``X-Api-Key: <app key>`` and ``X-User-Token: <access_token>``. List endpoints
@@ -24,7 +25,7 @@ Verified live 2026-06-28 against the CosmoLex sandbox firm 77 (OAuth host
 ``sandbox.cosmolex.com``; data host the ProfitSolv Azure app): the refresh-token
 grant mints a fresh ``access_token`` (HTTP 200 — the no-logout property), ``users``
 returns the real record (``totalCount`` 1), ``documents`` returns a real bare list
-(4 rows), and ``matters``/``clients``/``contacts``/``time-entries``/``expense``/
+(6 rows), and ``matters``/``clients``/``contacts``/``time-entries``/``expense``/
 ``invoices``/``payments`` return HTTP 200 with an empty envelope (the sandbox firm
 is otherwise blank). Coverage was confirmed identical to the verified Rocket Matter
 ``/v1`` rebuild (the SAME LCS API): ``transactions`` requires ``bankId``/``matterId``
@@ -114,6 +115,22 @@ _EXPIRY_SKEW = 90
 # the MCP tool indefinitely.
 _HTTP_TIMEOUT = 30
 
+# A JSON body carrying any of these keys (or ``success: false``) is an API
+# error/problem envelope, not a record. Used on the 404 detail path to reject an
+# error body that echoes an ``id``/``name`` so it is never mistaken for a real record
+# (which :meth:`_update` would then merge + PUT). Deliberately broad there: a real
+# record misjudged "not found" fails loudly, but an error envelope taken for a record
+# corrupts data.
+_ERROR_ENVELOPE_KEYS = (
+    "error",
+    "errors",
+    "message",
+    "detail",
+    "title",
+    "traceId",
+    "exception",
+)
+
 # Tools whose capability the LCS /v1 API does not expose (kept as fail-loud stubs).
 # Surfaced for Toby's keep/drop call — NOT silently dropped.
 COVERAGE_DELTA = [
@@ -125,7 +142,7 @@ COVERAGE_DELTA = [
     "get_invoice_allocations",
     "document actions: get_document_default_app / get_document_download_url / "
     "get_document_upload_url / delete_document (/v1 documents is read-only list)",
-    "Accounts Payable: list/get/create/update/delete bills, AP payments, vendors (11 tools)",
+    "Accounts Payable: list/get/create/update/delete bills, AP payments, vendors (12 tools)",
     "Lookups: all 17 (new-matter/contact/expense/invoice/time/transaction defaults, labels, suggestions)",
     "Codes: get_task_codes / get_activity_codes split (only the combined get_codes is in /v1)",
     "Text shortcuts (endpoint exists in /v1 but this OAuth app/user is not authorized -> 403)",
@@ -156,8 +173,10 @@ def _save_tokens(tokens: dict) -> None:
 def _token_record(data: dict, prev: dict | None = None) -> dict:
     """Normalise a token-endpoint response into the cached token record.
 
-    The ``refresh_token`` ROTATES on every refresh, so the new one must be saved or
-    the chain dies; if a response omits it, the previous one is retained.
+    The ``refresh_token`` is long-lived and static (live-proven NOT to rotate), but
+    this still re-saves whatever the token endpoint returns, so if the server ever
+    starts rotating it the new value is captured; if a response omits it, the previous
+    one is retained.
     """
     prev = prev or {}
     access = data.get("access_token")
@@ -203,7 +222,7 @@ def exchange_code(
     POSTs ``grant_type=authorization_code`` to the token endpoint. The body matches
     the live-verified recipe (grant_type + client_id + client_secret + code) — the
     verified exchange did NOT send a ``redirect_uri``, so it is omitted here; the
-    ``redirect_uri`` argument is kept only to build the consent URL. The rotating
+    ``redirect_uri`` argument is kept only to build the consent URL. The long-lived
     ``refresh_token`` returned here is what the client then uses to refresh forever
     without a password login. Returns the cached token record.
     """
@@ -268,7 +287,7 @@ class LCSClient:
         )
 
     def _refresh(self) -> None:
-        """Get a fresh access token via the rotating refresh token (no password)."""
+        """Get a fresh access token via the long-lived refresh token (no password)."""
         refresh_token = self._tokens.get("refresh_token")
         if not refresh_token:
             raise RuntimeError("No refresh_token cached. Run: cosmolex-mcp-setup")
@@ -362,16 +381,31 @@ class LCSClient:
         query.update({k: v for k, v in params.items() if v is not None})
         return self._json_or_raise(self._send("GET", resource, params=query))
 
+    @staticmethod
+    def _is_error_envelope(data: dict) -> bool:
+        """True if a JSON dict looks like an API error/problem envelope, not a record.
+
+        Checks an explicit ``success: false`` plus the common error/problem-details
+        keys (see ``_ERROR_ENVELOPE_KEYS``). Used to keep a 404 error body that echoes
+        an ``id``/``name`` from being treated as a found record.
+        """
+        if data.get("success") is False:
+            return True
+        return any(data.get(k) for k in _ERROR_ENVELOPE_KEYS)
+
     def _detail(self, resource: str, record_id) -> dict | None:
         """GET a single record by id via the RESTful item route.
 
         Returns the record dict, or ``None`` if it does not exist. Tolerates a known
         server quirk where an existing record is occasionally returned with a 404
-        status but a populated record body. The "found" path is strict: only a 2xx,
-        or a 404 whose body looks like a real record (carries ``id``/``name``),
-        counts as found. Any OTHER non-2xx status (401/403/409/5xx) RAISES — an error
-        envelope is never mistaken for a record (which would otherwise let
-        :meth:`_update` merge-and-PUT corrupt data).
+        status but a populated record body. The "found" path is strict: a 2xx with a
+        dict body, or a 404 whose body is unmistakably the record — a truthy ``id``
+        AND not an error envelope (see :meth:`_is_error_envelope`). A 404 / error
+        envelope that merely echoes an ``id``/``name`` is treated as NOT found, and any
+        OTHER non-2xx status (401/403/409/5xx) RAISES — so an error body is never
+        mistaken for a record (which would otherwise let :meth:`_update` merge-and-PUT
+        corrupt data). The bias is deliberate: a real record misjudged not-found fails
+        loudly in :meth:`_update`; the inverse corrupts.
         """
         resp = self._send("GET", f"{resource}/{record_id}")
         data = None
@@ -383,8 +417,15 @@ class LCSClient:
         if resp.ok:
             return data if isinstance(data, dict) else None
         if resp.status_code == 404:
-            # 404 + a record-shaped body = the known quirk (found); else not found.
-            if isinstance(data, dict) and (data.get("id") or data.get("name")):
+            # Known quirk: an existing record is occasionally returned WITH a 404
+            # status but a full record body. Accept that ONLY when the body is a real
+            # record — a truthy ``id`` and NOT an error envelope — so a 404 error body
+            # that echoes an id/name is treated as not-found.
+            if (
+                isinstance(data, dict)
+                and data.get("id")
+                and not self._is_error_envelope(data)
+            ):
                 return data
             return None
         raise RuntimeError(
@@ -414,13 +455,39 @@ class LCSClient:
         )
 
     def _delete(self, resource: str, record_id) -> dict:
-        """DELETE a record by id (204 -> ``{"success": True}``)."""
+        """DELETE a record by id.
+
+        A 2xx with no body (the common 204) is an unambiguous success. Some /v1 delete
+        routes instead return a 200 whose BODY reports the real outcome — a
+        ``{"success": false, ...}`` (or an ``error``/``errors`` payload) there is a
+        FAILURE despite the 2xx. The body is read so that is surfaced as an error
+        (Rule 12 — never a false success) rather than reported as deleted; only a body
+        that does not contradict success returns ``{"success": True}``.
+        """
         resp = self._send("DELETE", f"{resource}/{record_id}")
-        if resp.ok:
+        if not resp.ok:
+            raise RuntimeError(
+                f"Cosmolex /v1 error {resp.status_code}: {resp.text[:400]}"
+            )
+        if not resp.content:
             return {"success": True}
-        raise RuntimeError(
-            f"Cosmolex /v1 error {resp.status_code}: {resp.text[:400]}"
-        )
+        try:
+            data = resp.json()
+        except ValueError:
+            # A 2xx with a non-JSON body (e.g. empty string / plain text) = success.
+            return {"success": True}
+        if isinstance(data, dict) and (
+            data.get("success") is False
+            or (
+                data.get("success") is None
+                and (data.get("error") or data.get("errors"))
+            )
+        ):
+            raise RuntimeError(
+                f"Cosmolex /v1 delete reported failure despite HTTP "
+                f"{resp.status_code}: {str(data)[:400]}"
+            )
+        return {"success": True}
 
     def _not_in_v1(self, capability: str) -> RuntimeError:
         """Standard fail-loud error for a capability the LCS /v1 API lacks.

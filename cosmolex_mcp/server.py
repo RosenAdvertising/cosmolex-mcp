@@ -2,7 +2,6 @@
 """Cosmolex MCP server — LCS Integration API tools."""
 
 import json
-from functools import wraps
 from mcp.server.fastmcp import FastMCP
 from cosmolex_mcp.client import LCSClient
 
@@ -20,24 +19,12 @@ mcp = FastMCP(
     ),
 )
 
-_raw_tool = mcp.tool
-
-
-def _safe_tool(*args, **kwargs):
-    def decorator(fn):
-        @wraps(fn)
-        def wrapped(*fn_args, **fn_kwargs):
-            try:
-                return fn(*fn_args, **fn_kwargs)
-            except Exception as e:
-                return json.dumps({"error": str(e)})
-
-        return _raw_tool(*args, **kwargs)(wrapped)
-
-    return decorator
-
-
-mcp.tool = _safe_tool
+# Tools call the client directly and let exceptions propagate: FastMCP wraps a
+# raised exception into a CallToolResult with ``isError=True`` (the message in the
+# content), which is the correct MCP error contract. An earlier wrapper that caught
+# exceptions and returned ``{"error": ...}`` as a NORMAL result hid failures behind
+# ``isError=False`` — a write that applied but whose response errored looked failed,
+# risking a retry/duplicate. Failing loud via ``isError`` is both correct and safe.
 
 
 def _c():
@@ -765,7 +752,7 @@ def security_notes_resource() -> str:
       0600). The OAuth access + refresh tokens are cached in
       `~/.cosmolex-mcp/tokens.json` (chmod 0600). Data calls send
       `X-Api-Key` + `X-User-Token` headers; the client refreshes the access token
-      with the (rotating) refresh token on expiry or a 401 — no browser, no password.
+      with the long-lived refresh token on expiry or a 401 — no browser, no password.
       Re-run setup only if the refresh token is revoked.
 
     ## Tool classification
