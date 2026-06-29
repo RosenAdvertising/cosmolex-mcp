@@ -50,6 +50,12 @@ rules.
 ## Installation
 
 ```bash
+pip install cosmolex-mcp
+```
+
+Or from source:
+
+```bash
 uv pip install -e .
 # or
 pip install -e .
