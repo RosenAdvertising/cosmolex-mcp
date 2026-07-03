@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cosmolex-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "MCP server for CosmoLex — ProfitSolv LCS /v1 Integration API (scoped OAuth)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 keywords = ["cosmolex", "mcp", "legal", "law", "claude", "practice-management"]
 dependencies = [
-    "mcp>=1.27.2",
+    "mcp>=1.27.2,<2",
     "requests>=2.34.2",
     "keyring>=24.0.0",
 ]
