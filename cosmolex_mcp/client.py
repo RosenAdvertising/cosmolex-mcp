@@ -55,6 +55,7 @@ Toby's keep/drop call. See the module ``COVERAGE_DELTA`` list and the wiki page
 """
 
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -63,6 +64,8 @@ from urllib.parse import urlencode
 import requests
 
 from cosmolex_mcp import credentials
+
+logger = logging.getLogger(__name__)
 
 # Resolve credentials through the pluggable store (OS keyring -> env -> .env file).
 # The LCS /v1 OAuth model needs the app's API key + the OAuth client_id/secret; the
@@ -187,7 +190,8 @@ def _token_record(data: dict, prev: dict | None = None) -> dict:
     prev = prev or {}
     access = data.get("access_token")
     if not access:
-        raise RuntimeError(f"Token response had no access_token: {str(data)[:200]}")
+        logger.warning("oauth_token_response_rejected reason=missing_access_token")
+        raise RuntimeError("Token response had no access_token")
     return {
         "access_token": access,
         "refresh_token": data.get("refresh_token") or prev.get("refresh_token", ""),
@@ -235,6 +239,7 @@ def exchange_code(
     client_id = client_id or os.environ.get("COSMOLEX_CLIENT_ID", "")
     client_secret = client_secret or os.environ.get("COSMOLEX_CLIENT_SECRET", "")
     if not (client_id and client_secret):
+        logger.warning("oauth_code_exchange_rejected reason=missing_app_credentials")
         raise RuntimeError(
             "COSMOLEX_CLIENT_ID and COSMOLEX_CLIENT_SECRET are required to "
             "exchange the authorization code. Run: cosmolex-mcp-setup"
@@ -251,6 +256,10 @@ def exchange_code(
         timeout=30,
     )
     if not resp.ok:
+        logger.warning(
+            "oauth_code_exchange_rejected reason=upstream_error status=%s",
+            resp.status_code,
+        )
         raise RuntimeError(
             f"Authorization-code exchange failed ({resp.status_code}): "
             f"{resp.text[:300]}"
@@ -277,10 +286,12 @@ class LCSClient:
         self._client_secret = os.environ.get("COSMOLEX_CLIENT_SECRET", "")
         self._tokens = _load_tokens()
         if not self._tokens.get("access_token"):
+            logger.warning("client_initialization_rejected reason=missing_oauth_tokens")
             raise RuntimeError(
                 "No CosmoLex OAuth tokens found. Run: cosmolex-mcp-setup"
             )
         if not self._api_key:
+            logger.warning("client_initialization_rejected reason=missing_api_key")
             raise RuntimeError(
                 "COSMOLEX_API_KEY is not set. Run: cosmolex-mcp-setup"
             )
@@ -296,8 +307,10 @@ class LCSClient:
         """Get a fresh access token via the long-lived refresh token (no password)."""
         refresh_token = self._tokens.get("refresh_token")
         if not refresh_token:
+            logger.warning("oauth_refresh_rejected reason=missing_refresh_token")
             raise RuntimeError("No refresh_token cached. Run: cosmolex-mcp-setup")
         if not (self._client_id and self._client_secret):
+            logger.warning("oauth_refresh_rejected reason=missing_app_credentials")
             raise RuntimeError(
                 "COSMOLEX_CLIENT_ID / COSMOLEX_CLIENT_SECRET not set. "
                 "Run: cosmolex-mcp-setup"
@@ -314,6 +327,10 @@ class LCSClient:
             timeout=30,
         )
         if not resp.ok:
+            logger.warning(
+                "oauth_refresh_rejected reason=upstream_error status=%s",
+                resp.status_code,
+            )
             raise RuntimeError(
                 f"Token refresh failed ({resp.status_code}): {resp.text[:200]}. "
                 "The refresh token may be revoked — re-run cosmolex-mcp-setup."
@@ -368,6 +385,10 @@ class LCSClient:
     def _json_or_raise(resp: requests.Response):
         """Parse a JSON body, or raise a loud error on a non-2xx response."""
         if not resp.ok:
+            logger.warning(
+                "vendor_response_rejected reason=http_error status=%s",
+                resp.status_code,
+            )
             raise RuntimeError(
                 f"Cosmolex /v1 error {resp.status_code}: {resp.text[:400]}"
             )
@@ -381,11 +402,24 @@ class LCSClient:
         """GET a list endpoint -> the paginated envelope (or bare list for documents).
 
         ``page`` / ``pageSize`` are the live-confirmed pagination params; extra
-        non-None query params (filters) pass through unchanged.
+        non-None query params (filters) pass through unchanged. The response is
+        defensively capped even if an endpoint ignores ``pageSize``.
         """
+        if page < 1:
+            logger.warning("list_request_rejected reason=page_below_minimum")
+            raise ValueError("page must be at least 1")
+        if not 1 <= page_size <= 200:
+            logger.warning("list_request_rejected reason=page_size_out_of_range")
+            raise ValueError("page_size must be between 1 and 200")
         query: dict = {"page": page, "pageSize": page_size}
         query.update({k: v for k, v in params.items() if v is not None})
-        return self._json_or_raise(self._send("GET", resource, params=query))
+        data = self._json_or_raise(self._send("GET", resource, params=query))
+        if isinstance(data, list):
+            return data[:page_size]
+        if isinstance(data, dict) and isinstance(data.get("items"), list):
+            data = dict(data)
+            data["items"] = data["items"][:page_size]
+        return data
 
     @staticmethod
     def _is_error_envelope(data: dict) -> bool:
@@ -433,7 +467,12 @@ class LCSClient:
                 and not self._is_error_envelope(data)
             ):
                 return data
+            logger.warning("detail_response_rejected reason=not_found")
             return None
+        logger.warning(
+            "detail_response_rejected reason=http_error status=%s",
+            resp.status_code,
+        )
         raise RuntimeError(
             f"Cosmolex /v1 error {resp.status_code}: {resp.text[:400]}"
         )
@@ -454,6 +493,7 @@ class LCSClient:
         """
         current = self._detail(resource, record_id)
         if current is None:
+            logger.warning("update_rejected reason=record_not_found resource=%s", resource)
             raise RuntimeError(f"{resource} {record_id} not found; cannot update.")
         merged = {**current, **fields}
         return self._json_or_raise(
@@ -472,6 +512,10 @@ class LCSClient:
         """
         resp = self._send("DELETE", f"{resource}/{record_id}")
         if not resp.ok:
+            logger.warning(
+                "delete_rejected reason=http_error status=%s",
+                resp.status_code,
+            )
             raise RuntimeError(
                 f"Cosmolex /v1 error {resp.status_code}: {resp.text[:400]}"
             )
@@ -489,6 +533,10 @@ class LCSClient:
                 and (data.get("error") or data.get("errors"))
             )
         ):
+            logger.warning(
+                "delete_rejected reason=error_envelope status=%s",
+                resp.status_code,
+            )
             raise RuntimeError(
                 f"Cosmolex /v1 delete reported failure despite HTTP "
                 f"{resp.status_code}: {str(data)[:400]}"
@@ -501,6 +549,7 @@ class LCSClient:
         Never returns a false success — the tool raises so the gap is visible
         (Rule 12). Kept registered for Toby's keep/drop call; see ``COVERAGE_DELTA``.
         """
+        logger.warning("capability_rejected reason=not_in_vendor_api capability=%s", capability)
         return RuntimeError(
             f"'{capability}' is not available in the ProfitSolv LCS /v1 Integration "
             "API (the scoped-OAuth data API this MCP uses). It existed on the legacy "
@@ -722,6 +771,9 @@ class LCSClient:
         ``bank_id`` must come from the CosmoLex UI.
         """
         if not (matter_id or bank_id):
+            logger.warning(
+                "list_request_rejected reason=missing_transaction_scope"
+            )
             raise RuntimeError(
                 "list_transactions requires matter_id or bank_id — the LCS /v1 "
                 "transactions endpoint has no firm-wide listing, and /v1 exposes no "

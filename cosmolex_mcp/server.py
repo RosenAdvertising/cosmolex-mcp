@@ -2,10 +2,30 @@
 """Cosmolex MCP server — LCS Integration API tools."""
 
 import json
-from mcp.server.fastmcp import FastMCP
+import logging
+from typing import Annotated
+
+from mcp.server import MCPServer
+from pydantic import Field
+
 from cosmolex_mcp.client import LCSClient
 
-mcp = FastMCP(
+logger = logging.getLogger(__name__)
+
+PageNumber = Annotated[
+    int,
+    Field(ge=1, description="One-based vendor API page number."),
+]
+PageSize = Annotated[
+    int,
+    Field(
+        ge=1,
+        le=200,
+        description="Maximum records returned from the requested API page.",
+    ),
+]
+
+mcp = MCPServer(
     "cosmolex",
     instructions=(
         "Cosmolex legal practice management via the ProfitSolv LCS /v1 Integration "
@@ -19,7 +39,7 @@ mcp = FastMCP(
     ),
 )
 
-# Tools call the client directly and let exceptions propagate: FastMCP wraps a
+# Tools call the client directly and let exceptions propagate: MCPServer wraps a
 # raised exception into a CallToolResult with ``isError=True`` (the message in the
 # content), which is the correct MCP error contract. An earlier wrapper that caught
 # exceptions and returned ``{"error": ...}`` as a NORMAL result hid failures behind
@@ -37,8 +57,10 @@ def _fields(fields_json: str | None) -> dict:
     try:
         fields = json.loads(fields_json)
     except json.JSONDecodeError as e:
+        logger.warning("tool_input_rejected reason=invalid_fields_json")
         raise ValueError(f"Invalid fields_json: {e}") from e
     if not isinstance(fields, dict):
+        logger.warning("tool_input_rejected reason=fields_json_not_object")
         raise ValueError("fields_json must be a JSON object")
     return fields
 
@@ -48,8 +70,8 @@ def _fields(fields_json: str | None) -> dict:
 
 @mcp.tool()
 def list_matters(
-    page: int = 1,
-    page_size: int = 25,
+    page: PageNumber = 1,
+    page_size: PageSize = 25,
     client_id: str | None = None,
     matter_name: str | None = None,
 ) -> str:
@@ -97,8 +119,8 @@ def delete_matter(matter_id: str) -> str:
 
 @mcp.tool()
 def list_clients(
-    page: int = 1,
-    page_size: int = 25,
+    page: PageNumber = 1,
+    page_size: PageSize = 25,
     name: str | None = None,
     display_name: str | None = None,
 ) -> str:
@@ -145,7 +167,7 @@ def delete_client(client_id: str) -> str:
 
 
 @mcp.tool()
-def list_contacts(page: int = 1, page_size: int = 25) -> str:
+def list_contacts(page: PageNumber = 1, page_size: PageSize = 25) -> str:
     """List contacts with pagination."""
     return json.dumps(_c().list_contacts(page=page, page_size=page_size), indent=2)
 
@@ -180,8 +202,8 @@ def delete_contact(contact_id: str) -> str:
 @mcp.tool()
 def list_time_entries(
     matter_id: str | None = None,
-    page: int = 1,
-    page_size: int = 25,
+    page: PageNumber = 1,
+    page_size: PageSize = 25,
 ) -> str:
     """List time entries, paginated. Optional matter_id (GUID) filter — the only
     server-side filter the /v1 API honors for time entries."""
@@ -225,7 +247,7 @@ def delete_time_entry(time_entry_id: str) -> str:
 
 
 @mcp.tool()
-def list_expenses(page: int = 1, page_size: int = 25) -> str:
+def list_expenses(page: PageNumber = 1, page_size: PageSize = 25) -> str:
     """List expense cards, paginated (firm-wide). The /v1 API honors no server-side
     filter on expenses — not even matter_id — so none is offered."""
     return json.dumps(
@@ -262,7 +284,7 @@ def delete_expense(expense_id: str) -> str:
 
 
 @mcp.tool()
-def list_invoices(page: int = 1, page_size: int = 25) -> str:
+def list_invoices(page: PageNumber = 1, page_size: PageSize = 25) -> str:
     """List invoices with pagination."""
     return json.dumps(_c().list_invoices(page=page, page_size=page_size), indent=2)
 
@@ -331,7 +353,7 @@ def approve_invoice(invoice_id: str, invoice_number: str) -> str:
 
 
 @mcp.tool()
-def list_payments(page: int = 1, page_size: int = 25) -> str:
+def list_payments(page: PageNumber = 1, page_size: PageSize = 25) -> str:
     """List invoice payments with pagination."""
     return json.dumps(_c().list_payments(page=page, page_size=page_size), indent=2)
 
@@ -356,8 +378,8 @@ def get_invoice_allocations(fields_json: str | None = None) -> str:
 def list_transactions(
     matter_id: str | None = None,
     bank_id: str | None = None,
-    page: int = 1,
-    page_size: int = 25,
+    page: PageNumber = 1,
+    page_size: PageSize = 25,
 ) -> str:
     """List bank transactions for a matter or bank.
 
@@ -421,7 +443,7 @@ def delete_transaction(transaction_id: str) -> str:
 
 
 @mcp.tool()
-def list_documents(page: int = 1, page_size: int = 25) -> str:
+def list_documents(page: PageNumber = 1, page_size: PageSize = 25) -> str:
     """List documents, paginated (firm-wide, read-only). The /v1 API exposes no
     confirmed server-side filter for documents, so none is offered."""
     return json.dumps(_c().list_documents(page=page, page_size=page_size), indent=2)
@@ -459,7 +481,7 @@ def delete_document(path: str, doc_id: str) -> str:
 
 
 @mcp.tool()
-def list_users(page: int = 1, page_size: int = 25) -> str:
+def list_users(page: PageNumber = 1, page_size: PageSize = 25) -> str:
     """List firm users (a.k.a. timekeepers) with pagination. Each carries email,
     roles, default rate, and status."""
     return json.dumps(_c().list_users(page=page, page_size=page_size), indent=2)
@@ -473,7 +495,9 @@ def get_user(user_id: int) -> str:
 
 @mcp.tool()
 def list_timekeepers(
-    page: int = 1, page_size: int = 25, active_only: bool | None = None
+    page: PageNumber = 1,
+    page_size: PageSize = 25,
+    active_only: bool | None = None,
 ) -> str:
     """[Not in LCS /v1] Per-timekeeper billable/non-billable time summary is not in
     /v1; fails loudly. Use list_users for the firm's people list."""
@@ -497,7 +521,7 @@ def get_firm_summary() -> str:
 
 
 @mcp.tool()
-def list_text_shortcuts(page: int = 1, page_size: int = 25) -> str:
+def list_text_shortcuts(page: PageNumber = 1, page_size: PageSize = 25) -> str:
     """List text shortcuts/shorthands. The /v1 endpoint exists but the current OAuth
     app/user may not be authorized (returns a 403 until the scope is granted)."""
     return json.dumps(
@@ -649,7 +673,7 @@ def get_hard_cost_expense_lookups(matter_id: str | None = None) -> str:
 
 
 @mcp.tool()
-def list_ap_bills(page: int = 1, page_size: int = 25) -> str:
+def list_ap_bills(page: PageNumber = 1, page_size: PageSize = 25) -> str:
     """[Not in LCS /v1] List AP bills. Fails loudly."""
     return json.dumps(_c().list_ap_bills(page=page, page_size=page_size), indent=2)
 
@@ -679,7 +703,7 @@ def delete_ap_bill(bill_id: str) -> str:
 
 
 @mcp.tool()
-def list_ap_payments(page: int = 1, page_size: int = 25) -> str:
+def list_ap_payments(page: PageNumber = 1, page_size: PageSize = 25) -> str:
     """[Not in LCS /v1] List AP payments. Fails loudly."""
     return json.dumps(_c().list_ap_payments(page=page, page_size=page_size), indent=2)
 
@@ -697,7 +721,7 @@ def get_ap_payment_status(fields_json: str | None = None) -> str:
 
 
 @mcp.tool()
-def list_ap_vendors(page: int = 1, page_size: int = 25) -> str:
+def list_ap_vendors(page: PageNumber = 1, page_size: PageSize = 25) -> str:
     """[Not in LCS /v1] List AP vendors. Fails loudly."""
     return json.dumps(_c().list_ap_vendors(page=page, page_size=page_size), indent=2)
 
