@@ -17,6 +17,11 @@ dependencies = [
     "keyring>=24.0.0",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.4,<10",
+]
+
 [project.scripts]
 cosmolex-mcp = "cosmolex_mcp.server:main"
 cosmolex-mcp-setup = "cosmolex_mcp.setup.oauth_flow:main"
