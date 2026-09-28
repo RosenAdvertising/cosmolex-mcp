@@ -114,8 +114,9 @@ the cross-platform [`keyring`](https://github.com/jaraco/keyring) library:
 | Windows | Credential Manager                       |
 | Linux   | Secret Service (GNOME Keyring / KWallet) |
 
-Secrets are saved under the service name `cosmolex-mcp`. Nothing is written to disk in
-clear text.
+Secrets are saved under the service name `cosmolex-mcp` when a keyring backend is
+available. The file fallback below stores credentials on disk with restricted
+permissions.
 
 **File fallback.** On a host with no keyring backend (e.g. a headless Linux box
 without Secret Service), or if you set `COSMOLEX_MCP_USE_KEYRING=0`, credentials fall
