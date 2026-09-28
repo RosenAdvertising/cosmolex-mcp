@@ -43,6 +43,7 @@ rules.
 ## Requirements
 
 - Python 3.10+
+- Python MCP SDK >=2.2,<3 (separate from the MCP protocol revision)
 - Claude Desktop (or any MCP-compatible client)
 - A CosmoLex account **and** a registered OAuth integration (API key + OAuth client
   ID/secret) for the ProfitSolv LCS Integration API
