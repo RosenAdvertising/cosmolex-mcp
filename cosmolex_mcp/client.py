@@ -292,9 +292,7 @@ class LCSClient:
             )
         if not self._api_key:
             logger.warning("client_initialization_rejected reason=missing_api_key")
-            raise RuntimeError(
-                "COSMOLEX_API_KEY is not set. Run: cosmolex-mcp-setup"
-            )
+            raise RuntimeError("COSMOLEX_API_KEY is not set. Run: cosmolex-mcp-setup")
 
     # ── Auth ─────────────────────────────────────────────────────────────────
 
@@ -473,9 +471,7 @@ class LCSClient:
             "detail_response_rejected reason=http_error status=%s",
             resp.status_code,
         )
-        raise RuntimeError(
-            f"Cosmolex /v1 error {resp.status_code}: {resp.text[:400]}"
-        )
+        raise RuntimeError(f"Cosmolex /v1 error {resp.status_code}: {resp.text[:400]}")
 
     def _create(self, resource: str, body: dict) -> dict:
         """POST to a collection -> the created record (201)."""
@@ -493,7 +489,9 @@ class LCSClient:
         """
         current = self._detail(resource, record_id)
         if current is None:
-            logger.warning("update_rejected reason=record_not_found resource=%s", resource)
+            logger.warning(
+                "update_rejected reason=record_not_found resource=%s", resource
+            )
             raise RuntimeError(f"{resource} {record_id} not found; cannot update.")
         merged = {**current, **fields}
         return self._json_or_raise(
@@ -549,7 +547,9 @@ class LCSClient:
         Never returns a false success — the tool raises so the gap is visible
         (Rule 12). Kept registered for Toby's keep/drop call; see ``COVERAGE_DELTA``.
         """
-        logger.warning("capability_rejected reason=not_in_vendor_api capability=%s", capability)
+        logger.warning(
+            "capability_rejected reason=not_in_vendor_api capability=%s", capability
+        )
         return RuntimeError(
             f"'{capability}' is not available in the ProfitSolv LCS /v1 Integration "
             "API (the scoped-OAuth data API this MCP uses). It existed on the legacy "
@@ -771,9 +771,7 @@ class LCSClient:
         ``bank_id`` must come from the CosmoLex UI.
         """
         if not (matter_id or bank_id):
-            logger.warning(
-                "list_request_rejected reason=missing_transaction_scope"
-            )
+            logger.warning("list_request_rejected reason=missing_transaction_scope")
             raise RuntimeError(
                 "list_transactions requires matter_id or bank_id — the LCS /v1 "
                 "transactions endpoint has no firm-wide listing, and /v1 exposes no "

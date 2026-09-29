@@ -95,13 +95,14 @@ def test_sensitive_token_response_is_not_copied_to_error_or_log(
     sensitive = "sensitive-refresh-value"
     person = "person@example.test"
 
-    with caplog.at_level(logging.WARNING), pytest.raises(
-        RuntimeError,
-        match="^Token response had no access_token$",
-    ) as exc_info:
-        client_module._token_record(
-            {"refresh_token": sensitive, "userName": person}
-        )
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(
+            RuntimeError,
+            match="^Token response had no access_token$",
+        ) as exc_info,
+    ):
+        client_module._token_record({"refresh_token": sensitive, "userName": person})
 
     combined = caplog.text + str(exc_info.value)
     assert "oauth_token_response_rejected reason=missing_access_token" in combined

@@ -116,9 +116,7 @@ def main():
         tokens = exchange_code(code, redirect_uri, client_id, client_secret)
     except Exception as e:  # noqa: BLE001
         print(f"\n✗ Authorization failed: {e}")
-        print(
-            "Re-run cosmolex-mcp-setup and try a fresh code (codes are single-use)."
-        )
+        print("Re-run cosmolex-mcp-setup and try a fresh code (codes are single-use).")
         sys.exit(1)
 
     print("\n✓ Authorized — access + refresh tokens saved (chmod 600).")

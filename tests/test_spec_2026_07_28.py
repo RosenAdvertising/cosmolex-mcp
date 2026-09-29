@@ -245,9 +245,7 @@ def test_modern_http_enforces_routing_headers_versions_and_method_errors() -> No
     assert mismatch.status_code == 400
     assert mismatch.json()["error"]["code"] == -32020
 
-    unsupported = asyncio.run(
-        _post_modern("tools/list", protocol_version="2099-01-01")
-    )
+    unsupported = asyncio.run(_post_modern("tools/list", protocol_version="2099-01-01"))
     assert unsupported.status_code == 400
     assert unsupported.json()["error"]["code"] == -32022
 
