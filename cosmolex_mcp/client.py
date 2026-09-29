@@ -41,7 +41,7 @@ filters elsewhere, so those tools are pagination-only and never advertise a filt
 that returns unfiltered data. This filter set and the create→read→update→delete
 round-trips are INHERITED from the Rocket Matter live verification of this same /v1
 API; the blank CosmoLex sandbox firm could not exercise filtered reads or write
-round-trips directly (flagged UNVERIFIED-for-CosmoLex in the rebuild report).
+round-trips directly; those behaviors remain unverified for CosmoLex.
 
 COVERAGE: the LCS ``/v1`` API is narrower than the NextGen ``/api/v2`` set the
 previous CosmoLex build used. Resources it does NOT expose (timekeepers, firm
@@ -175,11 +175,10 @@ credentials.load_into_environ(
 # production = law.cosmolex.com. Override with COSMOLEX_BASE_URL.
 OAUTH_BASE = os.environ.get("COSMOLEX_BASE_URL", "https://sandbox.cosmolex.com")
 
-# LCS Integration data host (the ProfitSolv Azure app). This is a DIFFERENT host
-# from the OAuth host — the earlier "/v1 is dead on NextGen CosmoLex" misdiagnosis
-# came from calling /v1 on the cosmolex.com product host (an empty-200 / 403
-# catch-all), instead of this Azure data host. The default is the sandbox host; the
-# production data host is provisioned per-firm and set via COSMOLEX_API_BASE_URL.
+# LCS data requests use the ProfitSolv Azure host, separate from OAuth.
+# The product host may return an empty 200 or 403 for /v1 requests.
+# The default data host is the sandbox; set COSMOLEX_API_BASE_URL to the
+# production data host provisioned for the firm.
 API_BASE = os.environ.get(
     "COSMOLEX_API_BASE_URL",
     "https://lcs-developer-api-profi-sandbox-gncndgfccdgxdtff.centralus-01.azurewebsites.net",
