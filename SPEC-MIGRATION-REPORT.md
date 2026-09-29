@@ -56,9 +56,10 @@ transport. They do not establish live CosmoLex API behavior, credential loading,
 or deployed runtime behavior. Vendor ordering support remains unverified for
 CosmoLex beyond the existing method-level API notes; no sort parameter was added.
 
-## Open product decision
+## Error handling
 
-MCP 2.2.0 masks exception messages unless they are raised as `ToolError` or
-`ResourceError`. Keeping that masking limits information leakage, while using
-explicitly safe `ToolError` messages would give MCP clients more actionable
-feedback. Toby owns this choice. Existing exception behavior is unchanged.
+Known credential, authorization, vendor-response, and transport failures are raised
+as typed `ToolError` instances with sanitized client messages. Unexpected failures
+remain masked by the MCP boundary. Resource reads use the SDK's resource error
+handling boundary; messages and logs must not include credentials, submitted
+values, vendor response text, or exception details.

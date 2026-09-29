@@ -4,7 +4,7 @@
 import json
 import sys
 
-from cosmolex_mcp.client import LCSClient
+from cosmolex_mcp.client import LCSClient, SafeToolFailure
 
 
 def main():
@@ -19,8 +19,12 @@ def main():
         print(f"  (firm users: {total})")
         print()
         print(json.dumps(users, indent=2))
-    except Exception as e:  # noqa: BLE001
+    except SafeToolFailure as e:
         print(f"✗ Verification failed: {e}")
+        print("If the refresh token was revoked, re-run: cosmolex-mcp-setup")
+        sys.exit(1)
+    except Exception:  # noqa: BLE001
+        print("✗ Verification failed due to an unexpected local error.")
         print("If the refresh token was revoked, re-run: cosmolex-mcp-setup")
         sys.exit(1)
 

@@ -26,6 +26,7 @@ from cosmolex_mcp.client import (
     DEFAULT_REDIRECT_URI,
     OAUTH_BASE,
     REGISTERED_REDIRECT_URI,
+    SafeToolFailure,
     build_authorize_url,
     exchange_code,
 )
@@ -35,7 +36,10 @@ def _capture(name: str, prompt: str, secret: bool = False) -> str:
     val = os.environ.get(name, "").strip()
     if val:
         return val
-    val = (getpass.getpass(prompt) if secret else input(prompt)).strip()
+    try:
+        val = (getpass.getpass(prompt) if secret else input(prompt)).strip()
+    except EOFError:
+        return ""
     return val
 
 
@@ -107,22 +111,31 @@ def main():
         if arg.startswith("--code="):
             code = arg.split("=", 1)[1].strip()
     if not code:
-        code = input("Paste the authorization code here: ").strip()
+        try:
+            code = input("Paste the authorization code here: ").strip()
+        except EOFError:
+            code = ""
     if not code:
         print("Error: no authorization code provided.")
         sys.exit(1)
 
     try:
         tokens = exchange_code(code, redirect_uri, client_id, client_secret)
-    except Exception as e:  # noqa: BLE001
+    except SafeToolFailure as e:
         print(f"\n✗ Authorization failed: {e}")
         print("Re-run cosmolex-mcp-setup and try a fresh code (codes are single-use).")
+        sys.exit(1)
+    except Exception:  # noqa: BLE001
+        print("\n✗ Authorization failed due to an unexpected local error.")
+        print("Check the setup configuration and try again.")
         sys.exit(1)
 
     print("\n✓ Authorized — access + refresh tokens saved (chmod 600).")
     if tokens.get("firm_id"):
         print(f"  Firm: {tokens['firm_id']}   User: {tokens.get('user_name', '?')}")
-    print("Run 'cosmolex-mcp-verify' to test the connection.")
+    print(
+        "Restart the MCP server, then run 'cosmolex-mcp-verify' to test the connection."
+    )
 
 
 if __name__ == "__main__":

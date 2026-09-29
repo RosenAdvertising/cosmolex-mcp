@@ -13,7 +13,7 @@ log you out of your CosmoLex browser session while it runs.
 
 The server exposes **86 MCP tools**. The resources the LCS `/v1` API does not expose
 are kept as **fail-loud stubs** — they return a clear "not in the LCS /v1 API" error
-rather than silently returning nothing, pending a keep/drop decision.
+rather than silently returning nothing.
 
 ## What you can do
 

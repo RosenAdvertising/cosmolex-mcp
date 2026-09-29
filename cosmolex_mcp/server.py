@@ -7,7 +7,11 @@ from typing import Annotated
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.context import Context
-from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+from mcp.server.mcpserver.exceptions import (
+    ResourceError,
+    ToolError,
+    UnexpectedToolError,
+)
 from mcp.shared.exceptions import MCPError
 from mcp.types import CallToolResult, TextContent
 from pydantic import Field
@@ -98,10 +102,7 @@ def _find_safe_failure(exc: BaseException) -> SafeToolFailure | None:
 def _safe_failure_message(tool_name: str, failure: SafeToolFailure) -> str:
     # SDK's Tool.run prefixes anticipated failures with this exact label.
     if isinstance(failure, AuthorizationRejected):
-        return (
-            f"Error executing tool {tool_name}: CosmoLex rejected or expired authorization. "
-            "Reauthorize with: cosmolex-mcp-setup."
-        )
+        return f"Error executing tool {tool_name}: {failure}"
     return f"Error executing tool {tool_name}: {failure}"
 
 
@@ -124,6 +125,16 @@ def _schema_error_message(tool_name: str, error: ValidationError) -> str:
         for field in paths
     )
     return f"Error executing tool {tool_name}: Invalid arguments: {details}."
+
+
+def _resource_json(read):
+    try:
+        return json.dumps(read(), indent=2)
+    except SafeToolFailure as exc:
+        raise ResourceError(str(exc)) from None
+    except Exception:
+        logger.error("resource_read_failed reason=unexpected_exception")
+        raise ResourceError("CosmoLex resource could not be read.") from None
 
 
 def _expected_schema_shape(field: str, properties: dict) -> str:
@@ -688,7 +699,7 @@ def get_activity_codes(matter_id: str) -> str:
 
 # ── Lookups [Not in LCS /v1] ─────────────────────────────────────────────────────
 # None of the legacy lookup endpoints exist in the LCS /v1 API; every tool below
-# fails loudly. Kept registered for Toby's keep/drop call (see COVERAGE_DELTA).
+# fails loudly. Kept registered to report the unsupported API capability (see COVERAGE_DELTA).
 
 
 @mcp.tool()
@@ -795,7 +806,7 @@ def get_hard_cost_expense_lookups(matter_id: str | None = None) -> str:
 
 # ── Accounts Payable [Not in LCS /v1] ────────────────────────────────────────────
 # No AP endpoints exist in the LCS /v1 API; every tool below fails loudly. Kept
-# registered for Toby's keep/drop call (see COVERAGE_DELTA).
+# registered to report the unsupported API capability (see COVERAGE_DELTA).
 
 
 @mcp.tool()
@@ -878,13 +889,13 @@ def update_ap_vendor(vendor_id: str, fields_json: str) -> str:
 @mcp.resource("cosmolex://users", mime_type="application/json")
 def users_resource() -> str:
     """All firm users / timekeepers (email, roles, default rate, status)."""
-    return json.dumps(_c().list_users(page=1, page_size=100), indent=2)
+    return _resource_json(lambda: _c().list_users(page=1, page_size=100))
 
 
 @mcp.resource("cosmolex://clients", mime_type="application/json")
 def clients_resource() -> str:
     """The firm's clients (first page) — names, balances, and contact details."""
-    return json.dumps(_c().list_clients(page=1, page_size=100), indent=2)
+    return _resource_json(lambda: _c().list_clients(page=1, page_size=100))
 
 
 @mcp.resource("cosmolex://security-notes", mime_type="text/markdown")
@@ -917,7 +928,7 @@ def security_notes_resource() -> str:
       create_expense, update_expense, delete_expense, create_invoice, update_invoice,
       delete_invoice, create_payment, create_transaction, update_transaction,
       delete_transaction.
-    - **Not in LCS /v1 (fail loud — kept for keep/drop review):** get_firm_summary,
+    - **Not in LCS /v1 (fail loud):** get_firm_summary,
       list_timekeepers, list_banks, list_chart_of_accounts, generate_invoice,
       list_billable_items, approve_invoice, get_invoice_allocations, the document
       actions, get_task_codes/get_activity_codes, all 17 lookups, all Accounts
