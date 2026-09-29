@@ -62,10 +62,100 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import requests
+from mcp.server.mcpserver.exceptions import ToolError
 
 from cosmolex_mcp import credentials
 
 logger = logging.getLogger(__name__)
+
+
+class SafeToolFailure(ToolError):
+    """Known failure with deliberately safe client text and fixed log reason."""
+
+    reason = "known_failure"
+
+
+class MissingConfiguration(SafeToolFailure):
+    reason = "missing_configuration"
+
+
+class AuthorizationRejected(SafeToolFailure, RuntimeError):
+    reason = "authorization_rejected"
+
+
+class VendorHTTPFailure(SafeToolFailure):
+    reason = "vendor_http_failure"
+
+    def __init__(self, status: int, vendor_reason: str = ""):
+        self.status = status
+        # Strict allowlist: vendor-controlled text is never copied through.
+        safe_reasons = {
+            "invalid_request": "invalid request",
+            "invalid_grant": "authorization was rejected",
+            "insufficient_scope": "permission was denied",
+            "not_found": "resource was not found",
+            "validation_error": "request validation failed",
+            "internal_error": "vendor service error",
+        }
+        self.vendor_reason = safe_reasons.get(vendor_reason, "request failed")
+        detail = f": {self.vendor_reason}" if self.vendor_reason else ""
+        super().__init__(f"CosmoLex returned HTTP {status}{detail}.")
+
+
+class RateLimited(SafeToolFailure):
+    reason = "rate_limited"
+
+    def __init__(self, retry_after: int | None = None):
+        self.retry_after = (
+            retry_after
+            if retry_after is not None and 0 <= retry_after <= 86400
+            else None
+        )
+        hint = (
+            f" Retry after {self.retry_after} seconds."
+            if self.retry_after is not None
+            else " Retry after a short pause."
+        )
+        super().__init__("CosmoLex rate limit reached." + hint)
+
+
+class TransportFailure(SafeToolFailure):
+    reason = "transport_failure"
+
+
+class InvalidVendorResponse(SafeToolFailure):
+    reason = "invalid_vendor_response"
+
+    def __init__(self):
+        super().__init__(
+            "CosmoLex returned an unreadable response. Check the result in CosmoLex before retrying."
+        )
+
+
+class InvalidToolArgument(SafeToolFailure, ValueError):
+    reason = "invalid_argument"
+
+    def __init__(self, argument: str, expected: str):
+        self.argument = argument
+        self.expected = expected
+        super().__init__(f"Invalid argument '{argument}': expected {expected}.")
+
+
+class RecordNotFound(SafeToolFailure):
+    reason = "not_found"
+
+
+class UnsupportedCapability(SafeToolFailure):
+    reason = "unsupported_capability"
+
+
+class InvalidJSONInput(SafeToolFailure, ValueError):
+    reason = "invalid_argument"
+
+
+class TransactionScopeRequired(SafeToolFailure, RuntimeError):
+    reason = "invalid_argument"
+
 
 # Resolve credentials through the pluggable store (OS keyring -> env -> .env file).
 # The LCS /v1 OAuth model needs the app's API key + the OAuth client_id/secret; the
@@ -191,7 +281,7 @@ def _token_record(data: dict, prev: dict | None = None) -> dict:
     access = data.get("access_token")
     if not access:
         logger.warning("oauth_token_response_rejected reason=missing_access_token")
-        raise RuntimeError("Token response had no access_token")
+        raise AuthorizationRejected("Token response had no access_token")
     return {
         "access_token": access,
         "refresh_token": data.get("refresh_token") or prev.get("refresh_token", ""),
@@ -240,9 +330,9 @@ def exchange_code(
     client_secret = client_secret or os.environ.get("COSMOLEX_CLIENT_SECRET", "")
     if not (client_id and client_secret):
         logger.warning("oauth_code_exchange_rejected reason=missing_app_credentials")
-        raise RuntimeError(
-            "COSMOLEX_CLIENT_ID and COSMOLEX_CLIENT_SECRET are required to "
-            "exchange the authorization code. Run: cosmolex-mcp-setup"
+        raise MissingConfiguration(
+            "COSMOLEX_CLIENT_ID and COSMOLEX_CLIENT_SECRET are required. "
+            "Run: cosmolex-mcp-setup."
         )
     resp = requests.post(
         TOKEN_URL,
@@ -260,10 +350,7 @@ def exchange_code(
             "oauth_code_exchange_rejected reason=upstream_error status=%s",
             resp.status_code,
         )
-        raise RuntimeError(
-            f"Authorization-code exchange failed ({resp.status_code}): "
-            f"{resp.text[:300]}"
-        )
+        raise LCSClient._http_failure(resp)
     tokens = _token_record(resp.json())
     if save:
         _save_tokens(tokens)
@@ -287,12 +374,14 @@ class LCSClient:
         self._tokens = _load_tokens()
         if not self._tokens.get("access_token"):
             logger.warning("client_initialization_rejected reason=missing_oauth_tokens")
-            raise RuntimeError(
-                "No CosmoLex OAuth tokens found. Run: cosmolex-mcp-setup"
+            raise MissingConfiguration(
+                "No CosmoLex connection is configured. Run cosmolex-mcp-setup to connect."
             )
         if not self._api_key:
             logger.warning("client_initialization_rejected reason=missing_api_key")
-            raise RuntimeError("COSMOLEX_API_KEY is not set. Run: cosmolex-mcp-setup")
+            raise MissingConfiguration(
+                "COSMOLEX_API_KEY is not set. Run cosmolex-mcp-setup."
+            )
 
     # ── Auth ─────────────────────────────────────────────────────────────────
 
@@ -306,12 +395,14 @@ class LCSClient:
         refresh_token = self._tokens.get("refresh_token")
         if not refresh_token:
             logger.warning("oauth_refresh_rejected reason=missing_refresh_token")
-            raise RuntimeError("No refresh_token cached. Run: cosmolex-mcp-setup")
+            raise MissingConfiguration(
+                "No refresh token is configured. Run: cosmolex-mcp-setup."
+            )
         if not (self._client_id and self._client_secret):
             logger.warning("oauth_refresh_rejected reason=missing_app_credentials")
-            raise RuntimeError(
-                "COSMOLEX_CLIENT_ID / COSMOLEX_CLIENT_SECRET not set. "
-                "Run: cosmolex-mcp-setup"
+            raise MissingConfiguration(
+                "COSMOLEX_CLIENT_ID and COSMOLEX_CLIENT_SECRET are required. "
+                "Run: cosmolex-mcp-setup."
             )
         resp = requests.post(
             TOKEN_URL,
@@ -329,10 +420,11 @@ class LCSClient:
                 "oauth_refresh_rejected reason=upstream_error status=%s",
                 resp.status_code,
             )
-            raise RuntimeError(
-                f"Token refresh failed ({resp.status_code}): {resp.text[:200]}. "
-                "The refresh token may be revoked — re-run cosmolex-mcp-setup."
-            )
+            if resp.status_code in (400, 401, 403):
+                raise AuthorizationRejected(
+                    "CosmoLex rejected or expired authorization. Reauthorize with: cosmolex-mcp-setup."
+                )
+            raise self._http_failure(resp)
         self._tokens = _token_record(resp.json(), self._tokens)
         _save_tokens(self._tokens)
 
@@ -356,19 +448,10 @@ class LCSClient:
         the server (token rejected early) it refreshes once and retries. Returns the
         raw ``Response`` so callers can treat 404 specially (see :meth:`_detail`).
         """
-        if not self._token_valid():
-            self._refresh()
-        url = self._url(path)
-        resp = self.session.request(
-            method,
-            url,
-            params=params,
-            json=body,
-            headers=self._headers(),
-            timeout=_HTTP_TIMEOUT,
-        )
-        if resp.status_code == 401:
-            self._refresh()
+        try:
+            if not self._token_valid():
+                self._refresh()
+            url = self._url(path)
             resp = self.session.request(
                 method,
                 url,
@@ -377,7 +460,23 @@ class LCSClient:
                 headers=self._headers(),
                 timeout=_HTTP_TIMEOUT,
             )
-        return resp
+            if resp.status_code == 401:
+                self._refresh()
+                resp = self.session.request(
+                    method,
+                    url,
+                    params=params,
+                    json=body,
+                    headers=self._headers(),
+                    timeout=_HTTP_TIMEOUT,
+                )
+            return resp
+        except requests.exceptions.JSONDecodeError:
+            raise InvalidVendorResponse() from None
+        except requests.RequestException:
+            raise TransportFailure(
+                "CosmoLex request did not complete. Check the result in CosmoLex before retrying."
+            ) from None
 
     @staticmethod
     def _json_or_raise(resp: requests.Response):
@@ -387,12 +486,45 @@ class LCSClient:
                 "vendor_response_rejected reason=http_error status=%s",
                 resp.status_code,
             )
-            raise RuntimeError(
-                f"Cosmolex /v1 error {resp.status_code}: {resp.text[:400]}"
-            )
+            raise LCSClient._http_failure(resp)
         if not resp.content:
             return {}
-        return resp.json()
+        try:
+            return resp.json()
+        except ValueError:
+            raise InvalidVendorResponse() from None
+
+    @staticmethod
+    def _http_failure(resp: requests.Response) -> SafeToolFailure:
+        if resp.status_code == 429:
+            retry_after = None
+            try:
+                value = int(resp.headers.get("Retry-After", ""))
+                if 0 <= value <= 86400:
+                    retry_after = value
+            except (TypeError, ValueError):
+                pass
+            return RateLimited(retry_after)
+        if resp.status_code in (401, 403):
+            return AuthorizationRejected(
+                "CosmoLex rejected or expired authorization. Reauthorize with: cosmolex-mcp-setup."
+            )
+        if resp.status_code == 404:
+            return RecordNotFound(
+                "CosmoLex resource was not found. Check the requested record."
+            )
+        reason = ""
+        # Read only a generic vendor code from a small allowlist; never include
+        # response text, detail fields, URLs, or vendor supplied messages.
+        try:
+            payload = resp.json()
+            if isinstance(payload, dict):
+                candidate = payload.get("code") or payload.get("error")
+                if isinstance(candidate, str) and len(candidate) <= 40:
+                    reason = candidate.lower()
+        except (ValueError, TypeError):
+            pass
+        return VendorHTTPFailure(resp.status_code, reason)
 
     # ── Generic resource operations ──────────────────────────────────────────
 
@@ -405,10 +537,10 @@ class LCSClient:
         """
         if page < 1:
             logger.warning("list_request_rejected reason=page_below_minimum")
-            raise ValueError("page must be at least 1")
+            raise InvalidToolArgument("page", "an integer greater than or equal to 1")
         if not 1 <= page_size <= 200:
             logger.warning("list_request_rejected reason=page_size_out_of_range")
-            raise ValueError("page_size must be between 1 and 200")
+            raise InvalidToolArgument("page_size", "an integer from 1 to 200")
         query: dict = {"page": page, "pageSize": page_size}
         query.update({k: v for k, v in params.items() if v is not None})
         data = self._json_or_raise(self._send("GET", resource, params=query))
@@ -431,10 +563,10 @@ class LCSClient:
             return True
         return any(data.get(k) for k in _ERROR_ENVELOPE_KEYS)
 
-    def _detail(self, resource: str, record_id) -> dict | None:
+    def _detail(self, resource: str, record_id) -> dict:
         """GET a single record by id via the RESTful item route.
 
-        Returns the record dict, or ``None`` if it does not exist. Tolerates a known
+        Returns the record dict, or raises RecordNotFound if it does not exist. Tolerates a known
         server quirk where an existing record is occasionally returned with a 404
         status but a populated record body. The "found" path is strict: a 2xx with a
         dict body, or a 404 whose body is unmistakably the record — a truthy ``id``
@@ -453,7 +585,9 @@ class LCSClient:
             except ValueError:
                 data = None
         if resp.ok:
-            return data if isinstance(data, dict) else None
+            if isinstance(data, dict):
+                return data
+            raise InvalidVendorResponse()
         if resp.status_code == 404:
             # Known quirk: an existing record is occasionally returned WITH a 404
             # status but a full record body. Accept that ONLY when the body is a real
@@ -466,12 +600,12 @@ class LCSClient:
             ):
                 return data
             logger.warning("detail_response_rejected reason=not_found")
-            return None
+            raise RecordNotFound(f"{resource} record was not found.")
         logger.warning(
             "detail_response_rejected reason=http_error status=%s",
             resp.status_code,
         )
-        raise RuntimeError(f"Cosmolex /v1 error {resp.status_code}: {resp.text[:400]}")
+        raise self._http_failure(resp)
 
     def _create(self, resource: str, body: dict) -> dict:
         """POST to a collection -> the created record (201)."""
@@ -492,7 +626,9 @@ class LCSClient:
             logger.warning(
                 "update_rejected reason=record_not_found resource=%s", resource
             )
-            raise RuntimeError(f"{resource} {record_id} not found; cannot update.")
+            raise RecordNotFound(
+                f"{resource} record was not found; it cannot be updated."
+            )
         merged = {**current, **fields}
         return self._json_or_raise(
             self._send(method, f"{resource}/{record_id}", body=merged)
@@ -514,9 +650,7 @@ class LCSClient:
                 "delete_rejected reason=http_error status=%s",
                 resp.status_code,
             )
-            raise RuntimeError(
-                f"Cosmolex /v1 error {resp.status_code}: {resp.text[:400]}"
-            )
+            raise self._http_failure(resp)
         if not resp.content:
             return {"success": True}
         try:
@@ -535,27 +669,18 @@ class LCSClient:
                 "delete_rejected reason=error_envelope status=%s",
                 resp.status_code,
             )
-            raise RuntimeError(
-                f"Cosmolex /v1 delete reported failure despite HTTP "
-                f"{resp.status_code}: {str(data)[:400]}"
-            )
+            raise VendorHTTPFailure(resp.status_code, "internal_error")
         return {"success": True}
 
-    def _not_in_v1(self, capability: str) -> RuntimeError:
+    def _not_in_v1(self, capability: str) -> SafeToolFailure:
         """Standard fail-loud error for a capability the LCS /v1 API lacks.
 
         Never returns a false success — the tool raises so the gap is visible
         (Rule 12). Kept registered for Toby's keep/drop call; see ``COVERAGE_DELTA``.
         """
-        logger.warning(
-            "capability_rejected reason=not_in_vendor_api capability=%s", capability
-        )
-        return RuntimeError(
-            f"'{capability}' is not available in the ProfitSolv LCS /v1 Integration "
-            "API (the scoped-OAuth data API this MCP uses). It existed on the legacy "
-            "/api/v2 session API, which trips CosmoLex's single-session limit "
-            "and logs the user out — so it was intentionally dropped. This tool fails "
-            "loudly instead of reporting a false success."
+        logger.warning("capability_rejected reason=not_in_vendor_api")
+        return UnsupportedCapability(
+            f"{capability} is not available in the ProfitSolv LCS /v1 Integration API."
         )
 
     # ═════════════════════════════ Matters ══════════════════════════════════
@@ -772,10 +897,8 @@ class LCSClient:
         """
         if not (matter_id or bank_id):
             logger.warning("list_request_rejected reason=missing_transaction_scope")
-            raise RuntimeError(
-                "list_transactions requires matter_id or bank_id — the LCS /v1 "
-                "transactions endpoint has no firm-wide listing, and /v1 exposes no "
-                "bank-enumeration endpoint (get a bankId from the CosmoLex UI)."
+            raise TransactionScopeRequired(
+                "list_transactions requires matter_id or bank_id (one of these identifiers)."
             )
         return self._list(
             "transactions",

@@ -6,9 +6,19 @@ import logging
 from typing import Annotated
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.context import Context
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+from mcp.shared.exceptions import MCPError
+from mcp.types import CallToolResult, TextContent
 from pydantic import Field
+from pydantic import ValidationError
 
-from cosmolex_mcp.client import LCSClient
+from cosmolex_mcp.client import (
+    AuthorizationRejected,
+    InvalidJSONInput,
+    LCSClient,
+    SafeToolFailure,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +35,127 @@ PageSize = Annotated[
     ),
 ]
 
-mcp = MCPServer(
+
+class SafeErrorMCPServer(MCPServer):
+    """Keep MCP results actionable without logging exception content."""
+
+    async def _handle_call_tool(self, ctx, params):
+        context = Context(
+            request_context=ctx,
+            mcp_server=self,
+            input_params=params,
+            subscriptions=self._subscriptions,
+        )
+        name = params.name
+        try:
+            result = await self.call_tool(name, params.arguments or {}, context)
+            return result
+        except Exception as exc:
+            if isinstance(exc, MCPError):
+                raise
+            failure = _find_safe_failure(exc)
+            if failure is not None:
+                message = _safe_failure_message(name, failure)
+                logger.info("tool_call_rejected reason=%s", failure.reason)
+            elif (
+                isinstance(exc, ToolError)
+                and not isinstance(exc, UnexpectedToolError)
+                and isinstance(exc.__cause__, ValidationError)
+            ):
+                message = _schema_error_message(name, exc.__cause__)
+                logger.info("tool_call_rejected reason=invalid_schema_arguments")
+            elif isinstance(exc, ToolError) and not isinstance(
+                exc, UnexpectedToolError
+            ):
+                message = (
+                    f"Error executing tool {name}: The request could not be processed."
+                )
+                logger.info("tool_call_rejected reason=tool_error")
+            else:
+                # Match SDK's masked client text; never format/log exception or cause.
+                message = f"Error executing tool {name}"
+                logger.error("tool_call_failed reason=unexpected_exception")
+            return CallToolResult(
+                content=[TextContent(type="text", text=message)], is_error=True
+            )
+
+
+def _find_safe_failure(exc: BaseException) -> SafeToolFailure | None:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while (
+        isinstance(current, ToolError)
+        and not isinstance(current, UnexpectedToolError)
+        and id(current) not in seen
+    ):
+        if isinstance(current, SafeToolFailure):
+            return current
+        seen.add(id(current))
+        current = current.__cause__
+    return None
+
+
+def _safe_failure_message(tool_name: str, failure: SafeToolFailure) -> str:
+    # SDK's Tool.run prefixes anticipated failures with this exact label.
+    if isinstance(failure, AuthorizationRejected):
+        return (
+            f"Error executing tool {tool_name}: CosmoLex rejected or expired authorization. "
+            "Reauthorize with: cosmolex-mcp-setup."
+        )
+    return f"Error executing tool {tool_name}: {failure}"
+
+
+def _schema_error_message(tool_name: str, error: ValidationError) -> str:
+    paths = sorted(
+        {str(item["loc"][0]) if item["loc"] else "arguments" for item in error.errors()}
+    )
+    tool = next(
+        (
+            candidate
+            for candidate in mcp._tool_manager.list_tools()
+            if candidate.name == tool_name
+        ),
+        None,
+    )
+    properties = tool.parameters.get("properties", {}) if tool else {}
+    paths = [field if field in properties else "arguments" for field in paths]
+    details = ", ".join(
+        f"{field} (expected {_expected_schema_shape(field, properties)})"
+        for field in paths
+    )
+    return f"Error executing tool {tool_name}: Invalid arguments: {details}."
+
+
+def _expected_schema_shape(field: str, properties: dict) -> str:
+    schema = properties.get(field, {})
+    if "anyOf" in schema:
+        return " or ".join(
+            _expected_schema_shape(field, {field: option}) for option in schema["anyOf"]
+        )
+    kind = schema.get("type")
+    if kind == "null":
+        return "null"
+    if kind == "integer":
+        minimum, maximum = schema.get("minimum"), schema.get("maximum")
+        if minimum is not None and maximum is not None:
+            return f"an integer from {minimum} to {maximum}"
+        if minimum is not None:
+            return f"an integer greater than or equal to {minimum}"
+        if maximum is not None:
+            return f"an integer less than or equal to {maximum}"
+        return "an integer"
+    if kind == "string":
+        return "a string"
+    if kind == "boolean":
+        return "a boolean"
+    if kind == "array":
+        return "an array"
+    if kind == "object":
+        return "an object"
+    return "the declared input shape"
+
+
+mcp = SafeErrorMCPServer(
     "cosmolex",
     instructions=(
         "Cosmolex legal practice management via the ProfitSolv LCS /v1 Integration "
@@ -39,12 +169,8 @@ mcp = MCPServer(
     ),
 )
 
-# Tools call the client directly and let exceptions propagate: MCPServer wraps a
-# raised exception into a CallToolResult with ``isError=True`` (the message in the
-# content), which is the correct MCP error contract. An earlier wrapper that caught
-# exceptions and returned ``{"error": ...}`` as a NORMAL result hid failures behind
-# ``isError=False`` — a write that applied but whose response errored looked failed,
-# risking a retry/duplicate. Failing loud via ``isError`` is both correct and safe.
+# MCP dispatch converts typed failures to actionable isError results. Unknown errors
+# retain the SDK's generic masked message and are logged only with a fixed reason.
 
 
 def _c():
@@ -58,10 +184,10 @@ def _fields(fields_json: str | None) -> dict:
         fields = json.loads(fields_json)
     except json.JSONDecodeError as e:
         logger.warning("tool_input_rejected reason=invalid_fields_json")
-        raise ValueError(f"Invalid fields_json: {e}") from e
+        raise InvalidJSONInput("fields_json must be a JSON object") from e
     if not isinstance(fields, dict):
         logger.warning("tool_input_rejected reason=fields_json_not_object")
-        raise ValueError("fields_json must be a JSON object")
+        raise InvalidJSONInput("fields_json must be a JSON object")
     return fields
 
 

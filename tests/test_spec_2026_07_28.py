@@ -208,7 +208,10 @@ def test_tool_schema_rejects_out_of_range_page_size_as_complete_error() -> None:
     result = _result(response)
     assert result["isError"] is True
     assert result["resultType"] == "complete"
-    assert "less than or equal to 200" in result["content"][0]["text"]
+    assert (
+        result["content"][0]["text"]
+        == "Error executing tool list_matters: Invalid arguments: page_size (expected an integer from 1 to 200)."
+    )
 
 
 def test_modern_http_enforces_routing_headers_versions_and_method_errors() -> None:
