@@ -6,7 +6,6 @@ import logging
 from typing import Annotated
 
 from mcp.server import MCPServer
-from mcp.server.mcpserver.context import Context
 from mcp.server.mcpserver.exceptions import (
     ResourceError,
     ToolError,
@@ -43,16 +42,9 @@ PageSize = Annotated[
 class SafeErrorMCPServer(MCPServer):
     """Keep MCP results actionable without logging exception content."""
 
-    async def _handle_call_tool(self, ctx, params):
-        context = Context(
-            request_context=ctx,
-            mcp_server=self,
-            input_params=params,
-            subscriptions=self._subscriptions,
-        )
-        name = params.name
+    async def call_tool(self, name, arguments, context=None):
         try:
-            result = await self.call_tool(name, params.arguments or {}, context)
+            result = await super().call_tool(name, arguments, context)
             return result
         except Exception as exc:
             if isinstance(exc, MCPError):

@@ -82,6 +82,15 @@ class _FailedClient:
         raise self.failure
 
 
+def test_public_call_tool_preserves_safe_errors_without_transport(monkeypatch):
+    monkeypatch.setattr(server, "_c", lambda: _FailedClient(RateLimited(120)))
+    result = asyncio.run(server.mcp.call_tool("list_matters", {}))
+    assert result.is_error is True
+    assert result.content[0].text == (
+        "Error executing tool list_matters: CosmoLex rate limit reached. Retry after 120 seconds."
+    )
+
+
 def test_unsupported_capability_and_write_json_errors_are_actionable(monkeypatch):
     monkeypatch.setattr(server, "_c", lambda: object.__new__(LCSClient))
     unsupported = _call("list_banks")
