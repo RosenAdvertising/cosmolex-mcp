@@ -47,7 +47,12 @@ def test_setup_bad_credentials_are_sanitized_and_http_timeout_is_set(
     monkeypatch.setenv("COSMOLEX_API_KEY", "fake-api-secret")
     monkeypatch.setenv("COSMOLEX_CLIENT_ID", "fake-client-id")
     monkeypatch.setenv("COSMOLEX_CLIENT_SECRET", "fake-client-secret")
-    monkeypatch.setenv("COSMOLEX_OAUTH_CODE", "fake-oauth-code")
+    monkeypatch.setattr(oauth_flow, "new_state", lambda: "expected")
+    from unittest.mock import MagicMock
+
+    callback = MagicMock()
+    callback.__enter__.return_value.receive.return_value = "fake-oauth-code"
+    monkeypatch.setattr(oauth_flow, "LoopbackCallback", lambda *a: callback)
     monkeypatch.setattr(oauth_flow.credentials, "set_secret", lambda *_: "keyring")
     monkeypatch.setattr(oauth_flow.credentials, "delete_secret", lambda *_: None)
     captured = {}

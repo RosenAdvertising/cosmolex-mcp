@@ -57,6 +57,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 from pathlib import Path
 from urllib.parse import quote, urlencode
@@ -65,6 +66,8 @@ import requests
 from mcp.server.mcpserver.exceptions import ToolError
 
 from cosmolex_mcp import credentials
+from cosmolex_mcp.private_storage import atomic_private_write
+from cosmolex_mcp.endpoint_validation import LCS_HOSTS, vendor_endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -200,23 +203,16 @@ API_BASE = os.environ.get(
     "https://lcs-developer-api-profi-sandbox-gncndgfccdgxdtff.centralus-01.azurewebsites.net",
 )
 
+OAUTH_BASE = vendor_endpoint(OAUTH_BASE, {"sandbox.cosmolex.com", "law.cosmolex.com"})
+API_BASE = vendor_endpoint(API_BASE, LCS_HOSTS)
+
 TOKEN_URL = f"{OAUTH_BASE}/api/ext/auth/token"
 AUTHORIZE_URL = f"{OAUTH_BASE}/OAuth/authorize"
 
-# Registered redirect URI for the OAuth app — a hard constant, NOT env-derived, so the
-# setup wizard can detect a stored/overridden redirect that differs from what the app
-# will actually accept (a mismatch breaks consent). The CosmoLex sandbox app registered
-# ``https://localhost:8770/callback``; setup uses a manual copy-paste of the ``code``
-# from the address bar (the browser lands on localhost:8770, which need not be served,
-# and the ``code`` query param is copied back).
-REGISTERED_REDIRECT_URI = "https://localhost:8770/callback"
-
-# Effective redirect for building the consent URL: an explicit COSMOLEX_REDIRECT_URI
-# override wins (for an app that registered a different redirect), else the registered
-# constant above.
-DEFAULT_REDIRECT_URI = (
-    os.environ.get("COSMOLEX_REDIRECT_URI") or REGISTERED_REDIRECT_URI
-)
+# The firm must register this exact HTTP loopback redirect with the vendor.
+# Setup binds the listener before advertising authorization and validates overrides.
+REGISTERED_REDIRECT_URI = "http://127.0.0.1:8770/callback"
+DEFAULT_REDIRECT_URI = REGISTERED_REDIRECT_URI
 
 CONFIG_DIR = Path.home() / ".cosmolex-mcp"
 TOKEN_FILE = CONFIG_DIR / "tokens.json"
@@ -273,14 +269,7 @@ def _load_tokens() -> dict:
 
 
 def _save_tokens(tokens: dict) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        CONFIG_DIR.chmod(0o700)
-    except OSError:
-        pass
-    with open(TOKEN_FILE, "w") as f:
-        json.dump(tokens, f, indent=2)
-    os.chmod(TOKEN_FILE, 0o600)
+    atomic_private_write(TOKEN_FILE, json.dumps(tokens, indent=2))
 
 
 def _token_record(data: dict, prev: dict | None = None) -> dict:
@@ -309,7 +298,9 @@ def _token_record(data: dict, prev: dict | None = None) -> dict:
 
 
 def build_authorize_url(
-    redirect_uri: str | None = None, client_id: str | None = None
+    redirect_uri: str | None = None,
+    client_id: str | None = None,
+    state: str | None = None,
 ) -> str:
     """Build the browser consent URL the user opens to authorize the integration."""
     client_id = client_id or os.environ.get("COSMOLEX_CLIENT_ID", "")
@@ -319,6 +310,7 @@ def build_authorize_url(
             "client_id": client_id,
             "redirect_uri": redirect_uri,
             "response_type": "code",
+            "state": state or secrets.token_urlsafe(32),
         }
     )
     return f"{AUTHORIZE_URL}?{query}"
@@ -359,6 +351,7 @@ def exchange_code(
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=30,
+            allow_redirects=False,
         )
     except requests.RequestException:
         raise TransportFailure(
@@ -437,6 +430,7 @@ class LCSClient:
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 timeout=30,
+                allow_redirects=False,
             )
         except requests.RequestException:
             raise TransportFailure(
@@ -493,6 +487,7 @@ class LCSClient:
                 json=body,
                 headers=self._headers(),
                 timeout=_HTTP_TIMEOUT,
+                allow_redirects=False,
             )
             if resp.status_code == 401:
                 self._refresh()
@@ -503,6 +498,7 @@ class LCSClient:
                     json=body,
                     headers=self._headers(),
                     timeout=_HTTP_TIMEOUT,
+                    allow_redirects=False,
                 )
             return resp
         except requests.exceptions.JSONDecodeError:
@@ -686,6 +682,8 @@ class LCSClient:
         ``400 "Name cannot be empty"``), so the current record must be merged in.
         ``method`` is ``PUT`` for most resources, ``PATCH`` for invoices.
         """
+        if not fields:
+            raise InvalidToolArgument("fields", "a non-empty object")
         record_id = _path_id(record_id, "record_id")
         current = self._detail(resource, record_id)
         if current is None:

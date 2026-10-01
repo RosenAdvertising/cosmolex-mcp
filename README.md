@@ -68,16 +68,19 @@ pip install -e .
 cosmolex-mcp-setup
 ```
 
+Before setup, register **`http://127.0.0.1:8770/callback`** as an OAuth redirect
+with CosmoLex / ProfitSolv. The old HTTPS localhost registration must be changed
+to this HTTP loopback redirect.
+
 The wizard:
 
 1. Stores your integration's **API key**, **OAuth client ID**, and **client secret**
    in your OS keyring (see Credential storage below).
-2. Prints an authorization URL. Open it in your browser (logged in to CosmoLex) and
-   click **Allow**.
-3. Your browser redirects to the app's registered redirect URI
-   (`https://localhost:8770/callback`) with a `?code=...` parameter. The browser may
-   show a connection error — that's fine; just copy the `code` value from the address
-   bar and paste it back into the wizard.
+2. Binds the local callback, then prints an authorization URL. Open it in your
+   browser (logged in to CosmoLex) and click **Allow**. If the port is occupied,
+   setup stops before printing the URL.
+3. Your browser redirects to `http://127.0.0.1:8770/callback`. The listener checks
+   the callback path and session's random `state` before accepting the code.
 4. The wizard exchanges the code for an access token + refresh token, cached at
    `~/.cosmolex-mcp/tokens.json` (chmod 600).
 
@@ -158,3 +161,24 @@ provisioned per-firm).
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Setup security
+
+Register the exact `COSMOLEX_REDIRECT_URI` with the vendor (default:
+`http://127.0.0.1:8770/callback`). Overrides must use HTTP and exactly `127.0.0.1`,
+with an explicit port and callback path. `localhost`, IPv6 and external callbacks
+are rejected. Setup binds that address before displaying authorization and receives
+the callback automatically; manual redirect pastes, bare codes, `--code` arguments
+and `COSMOLEX_OAUTH_CODE` are not supported.
+Fallback credentials and tokens are atomically written with `0600` permissions
+established before any secret bytes are written; permission failures stop the write.
+
+OAuth endpoints accept only `https://sandbox.cosmolex.com` and
+`https://law.cosmolex.com`. Data endpoints accept only the exact two ProfitSolv LCS
+hosts in `cosmolex_mcp/endpoint_validation.py`. Endpoints reject userinfo, paths,
+query strings, fragments and non-default ports. No Azure suffix wildcard is used.
+The [CosmoLex host documentation](https://support.cosmolex.com/knowledge-base/access-cosmolex-app/)
+identifies the production product host; the
+[public LCS sandbox Swagger document](https://lcs-developer-api-profi-sandbox-gncndgfccdgxdtff.centralus-01.azurewebsites.net/swagger/v1/swagger.json)
+identifies the LCS gateway. Additional provisioned hosts require verification and
+an explicit allowlist update.

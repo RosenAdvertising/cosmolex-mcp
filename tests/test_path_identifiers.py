@@ -73,6 +73,8 @@ def client_and_arguments(method):
         kwargs["tag_ids"] = [1]
     if method == "update_contact" and LCSClient.__name__ == "CloudTalkClient":
         kwargs["name"] = "probe"
+    if method.startswith("update_"):
+        kwargs["name"] = "probe"
     return client, kwargs, request, send
 
 
