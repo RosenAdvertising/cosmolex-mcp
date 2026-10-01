@@ -56,6 +56,7 @@ the module ``COVERAGE_DELTA`` list.
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from urllib.parse import quote, urlencode
@@ -66,6 +67,21 @@ from mcp.server.mcpserver.exceptions import ToolError
 from cosmolex_mcp import credentials
 
 logger = logging.getLogger(__name__)
+
+
+def _path_id(value, parameter: str) -> str:
+    """Validate a plain identifier before URL quoting or any HTTP request."""
+    expected = (
+        "a non-empty plain identifier (ASCII letters, digits, -, _, ., ~); not . or .."
+    )
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (str, int))
+        or str(value) in {".", ".."}
+        or re.fullmatch(r"[A-Za-z0-9._~-]+", str(value)) is None
+    ):
+        raise InvalidToolArgument(parameter, expected)
+    return quote(str(value), safe="")
 
 
 class SafeToolFailure(ToolError):
@@ -620,7 +636,7 @@ class LCSClient:
         corrupt data). The bias is deliberate: a real record misjudged not-found fails
         loudly in :meth:`_update`; the inverse corrupts.
         """
-        resp = self._send("GET", f"{resource}/{quote(str(record_id), safe='')}")
+        resp = self._send("GET", f"{resource}/{_path_id(record_id, 'record_id')}")
         data = None
         if resp.content:
             try:
@@ -670,6 +686,7 @@ class LCSClient:
         ``400 "Name cannot be empty"``), so the current record must be merged in.
         ``method`` is ``PUT`` for most resources, ``PATCH`` for invoices.
         """
+        record_id = _path_id(record_id, "record_id")
         current = self._detail(resource, record_id)
         if current is None:
             logger.warning(
@@ -681,7 +698,7 @@ class LCSClient:
         merged = {**current, **fields}
         return self._json_or_raise(
             self._send(
-                method, f"{resource}/{quote(str(record_id), safe='')}", body=merged
+                method, f"{resource}/{_path_id(record_id, 'record_id')}", body=merged
             )
         )
 
@@ -695,7 +712,7 @@ class LCSClient:
         (never report a false success) rather than reported as deleted; only a body
         that does not contradict success returns ``{"success": True}``.
         """
-        resp = self._send("DELETE", f"{resource}/{quote(str(record_id), safe='')}")
+        resp = self._send("DELETE", f"{resource}/{_path_id(record_id, 'record_id')}")
         if not resp.ok:
             logger.warning(
                 "delete_rejected reason=http_error status=%s",
@@ -759,16 +776,16 @@ class LCSClient:
         )
 
     def get_matter(self, matter_id: str) -> dict | None:
-        return self._detail("matters", matter_id)
+        return self._detail("matters", _path_id(matter_id, "matter_id"))
 
     def create_matter(self, **fields) -> dict:
         return self._create("matters", fields)
 
     def update_matter(self, matter_id: str, **fields) -> dict:
-        return self._update("matters", matter_id, fields)
+        return self._update("matters", _path_id(matter_id, "matter_id"), fields)
 
     def delete_matter(self, matter_id: str) -> dict:
-        return self._delete("matters", matter_id)
+        return self._delete("matters", _path_id(matter_id, "matter_id"))
 
     # ═════════════════════════════ Clients ══════════════════════════════════
 
@@ -794,7 +811,7 @@ class LCSClient:
         )
 
     def get_client(self, client_id: str) -> dict | None:
-        return self._detail("clients", client_id)
+        return self._detail("clients", _path_id(client_id, "client_id"))
 
     def create_client(self, **fields) -> dict:
         """Create a client (``POST /v1/clients``). Only ``name`` is required
@@ -802,10 +819,10 @@ class LCSClient:
         return self._create("clients", fields)
 
     def update_client(self, client_id: str, **fields) -> dict:
-        return self._update("clients", client_id, fields)
+        return self._update("clients", _path_id(client_id, "client_id"), fields)
 
     def delete_client(self, client_id: str) -> dict:
-        return self._delete("clients", client_id)
+        return self._delete("clients", _path_id(client_id, "client_id"))
 
     # ═════════════════════════════ Contacts ═════════════════════════════════
 
@@ -814,16 +831,16 @@ class LCSClient:
         return self._list("contacts", page=page, page_size=page_size)
 
     def get_contact(self, contact_id: str) -> dict | None:
-        return self._detail("contacts", contact_id)
+        return self._detail("contacts", _path_id(contact_id, "contact_id"))
 
     def create_contact(self, **fields) -> dict:
         return self._create("contacts", fields)
 
     def update_contact(self, contact_id: str, **fields) -> dict:
-        return self._update("contacts", contact_id, fields)
+        return self._update("contacts", _path_id(contact_id, "contact_id"), fields)
 
     def delete_contact(self, contact_id: str) -> dict:
-        return self._delete("contacts", contact_id)
+        return self._delete("contacts", _path_id(contact_id, "contact_id"))
 
     # ════════════════════════════ Time Entries ══════════════════════════════
 
@@ -844,16 +861,18 @@ class LCSClient:
         )
 
     def get_time_entry(self, time_entry_id: str) -> dict | None:
-        return self._detail("time-entries", time_entry_id)
+        return self._detail("time-entries", _path_id(time_entry_id, "time_entry_id"))
 
     def create_time_entry(self, **fields) -> dict:
         return self._create("time-entries", fields)
 
     def update_time_entry(self, time_entry_id: str, **fields) -> dict:
-        return self._update("time-entries", time_entry_id, fields)
+        return self._update(
+            "time-entries", _path_id(time_entry_id, "time_entry_id"), fields
+        )
 
     def delete_time_entry(self, time_entry_id: str) -> dict:
-        return self._delete("time-entries", time_entry_id)
+        return self._delete("time-entries", _path_id(time_entry_id, "time_entry_id"))
 
     # ═════════════════════════════ Expenses ═════════════════════════════════
     # Note the SINGULAR /v1 path: ``/v1/expense`` (plural ``/v1/expenses`` 404s).
@@ -868,16 +887,16 @@ class LCSClient:
         return self._list("expense", page=page, page_size=page_size)
 
     def get_expense(self, expense_id: str) -> dict | None:
-        return self._detail("expense", expense_id)
+        return self._detail("expense", _path_id(expense_id, "expense_id"))
 
     def create_expense(self, **fields) -> dict:
         return self._create("expense", fields)
 
     def update_expense(self, expense_id: str, **fields) -> dict:
-        return self._update("expense", expense_id, fields)
+        return self._update("expense", _path_id(expense_id, "expense_id"), fields)
 
     def delete_expense(self, expense_id: str) -> dict:
-        return self._delete("expense", expense_id)
+        return self._delete("expense", _path_id(expense_id, "expense_id"))
 
     # ═════════════════════════════ Invoices ═════════════════════════════════
     # Update verb is PATCH (not PUT) for invoices, per the live OPTIONS probe.
@@ -887,7 +906,7 @@ class LCSClient:
         return self._list("invoices", page=page, page_size=page_size)
 
     def get_invoice(self, invoice_id: str) -> dict | None:
-        return self._detail("invoices", invoice_id)
+        return self._detail("invoices", _path_id(invoice_id, "invoice_id"))
 
     def create_invoice(self, **fields) -> dict:
         """Create an invoice (``POST /v1/invoices``). The required body has not been
@@ -896,10 +915,12 @@ class LCSClient:
         return self._create("invoices", fields)
 
     def update_invoice(self, invoice_id: str, **fields) -> dict:
-        return self._update("invoices", invoice_id, fields, method="PATCH")
+        return self._update(
+            "invoices", _path_id(invoice_id, "invoice_id"), fields, method="PATCH"
+        )
 
     def delete_invoice(self, invoice_id: str) -> dict:
-        return self._delete("invoices", invoice_id)
+        return self._delete("invoices", _path_id(invoice_id, "invoice_id"))
 
     def generate_invoice(self, *args, **kwargs) -> dict:
         raise self._not_in_v1(
@@ -960,7 +981,7 @@ class LCSClient:
         )
 
     def get_transaction(self, transaction_id: str) -> dict | None:
-        return self._detail("transactions", transaction_id)
+        return self._detail("transactions", _path_id(transaction_id, "transaction_id"))
 
     def create_transaction(self, **fields) -> dict:
         """Create a bank transaction (``POST /v1/transactions``). Body caller-supplied
@@ -968,10 +989,12 @@ class LCSClient:
         return self._create("transactions", fields)
 
     def update_transaction(self, transaction_id: str, **fields) -> dict:
-        return self._update("transactions", transaction_id, fields)
+        return self._update(
+            "transactions", _path_id(transaction_id, "transaction_id"), fields
+        )
 
     def delete_transaction(self, transaction_id: str) -> dict:
-        return self._delete("transactions", transaction_id)
+        return self._delete("transactions", _path_id(transaction_id, "transaction_id"))
 
     def list_banks(self, *args, **kwargs) -> dict:
         raise self._not_in_v1("list_banks (bank enumeration)")
@@ -1012,7 +1035,7 @@ class LCSClient:
         return self._list("users", page=page, page_size=page_size)
 
     def get_user(self, user_id: int) -> dict | None:
-        return self._detail("users", user_id)
+        return self._detail("users", _path_id(user_id, "user_id"))
 
     def list_timekeepers(self, *args, **kwargs) -> dict:
         raise self._not_in_v1(
@@ -1057,7 +1080,7 @@ class LCSClient:
         return self._list("text-shortcuts", page=page, page_size=page_size)
 
     def get_text_shortcut(self, shortcut_id: int) -> dict | None:
-        return self._detail("text-shortcuts", shortcut_id)
+        return self._detail("text-shortcuts", _path_id(shortcut_id, "shortcut_id"))
 
     # ═══════════════════════════════ Lookups ════════════════════════════════
     # None of the legacy lookup endpoints exist in the LCS /v1 API (all 404).

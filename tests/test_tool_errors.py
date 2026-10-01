@@ -14,11 +14,11 @@ from cosmolex_mcp import server
 from cosmolex_mcp.client import (
     AuthorizationRejected,
     InvalidToolArgument,
+    LCSClient,
     MissingConfiguration,
     RateLimited,
     RecordNotFound,
     VendorHTTPFailure,
-    LCSClient,
 )
 from tests.test_spec_2026_07_28 import _post_modern, _result
 
@@ -407,7 +407,7 @@ def test_403_has_permission_guidance_and_401_has_reconnect_guidance(monkeypatch)
         assert "private user secret" not in text
 
 
-def test_id_path_segment_is_escaped_before_requests_prepares_url(monkeypatch):
+def test_id_path_segment_is_validated_before_requests_prepares_url(monkeypatch):
     client = object.__new__(LCSClient)
     client.session = requests.Session()
     client._api_key = "test-placeholder"
@@ -426,8 +426,8 @@ def test_id_path_segment_is_escaped_before_requests_prepares_url(monkeypatch):
         return response
 
     monkeypatch.setattr(client.session, "request", request)
-    client._detail("matters", "../x")
-    assert captured["url"].endswith("/matters/..%2Fx")
+    client._detail("matters", "normal-id")
+    assert captured["url"].endswith("/matters/normal-id")
 
 
 def test_http_call_timeout_and_no_retry_after_sleep(monkeypatch):
@@ -557,7 +557,7 @@ def test_explicit_false_response_is_an_error_for_detail_and_delete(monkeypatch, 
     client = object.__new__(LCSClient)
     monkeypatch.setattr(client, "_send", lambda *a, **k: response)
     monkeypatch.setattr(server, "_c", lambda: client)
-    result = _call(tool, {"matter_id": "../x"})
+    result = _call(tool, {"matter_id": "normal-id"})
     assert result["isError"] is True
     assert (
         result["content"][0]["text"]

@@ -13,8 +13,7 @@ from mcp.server.mcpserver.exceptions import (
 )
 from mcp.shared.exceptions import MCPError
 from mcp.types import CallToolResult, TextContent
-from pydantic import Field
-from pydantic import ValidationError
+from pydantic import BeforeValidator, Field, ValidationError
 
 from cosmolex_mcp.client import (
     AuthorizationRejected,
@@ -24,6 +23,17 @@ from cosmolex_mcp.client import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _reject_boolean_path_id(value):
+    """Reject booleans before integer coercion; preserve all other SDK inputs."""
+    if isinstance(value, bool):
+        raise ValueError("Use an integer identifier, not a boolean.")
+    return value
+
+
+# A before-validator preserves the existing integer JSON schema and coercions.
+PathId = Annotated[int, BeforeValidator(_reject_boolean_path_id)]
 
 PageNumber = Annotated[
     int,
@@ -617,7 +627,7 @@ def list_users(page: PageNumber = 1, page_size: PageSize = 25) -> str:
 
 
 @mcp.tool()
-def get_user(user_id: int) -> str:
+def get_user(user_id: PathId) -> str:
     """Get a firm user by numeric ID."""
     return json.dumps(_c().get_user(user_id), indent=2)
 
@@ -659,7 +669,7 @@ def list_text_shortcuts(page: PageNumber = 1, page_size: PageSize = 25) -> str:
 
 
 @mcp.tool()
-def get_text_shortcut(shortcut_id: int) -> str:
+def get_text_shortcut(shortcut_id: PathId) -> str:
     """Get a text shortcut by ID (subject to the same /v1 authorization as
     list_text_shortcuts)."""
     return json.dumps(_c().get_text_shortcut(shortcut_id), indent=2)
