@@ -125,6 +125,10 @@ permissions.
 without Secret Service), or if you set `COSMOLEX_MCP_USE_KEYRING=0`, credentials fall
 back to a `~/.cosmolex-mcp/.env` file with `0600` permissions.
 
+On Windows, the OS credential store is used for client credentials; the file
+fallback and token-file persistence are not supported because private secret-file
+writes require `os.fchmod` (including setup and token refresh).
+
 **Read order.** Credentials resolve in the order OS keyring → process environment →
 `.env` file.
 

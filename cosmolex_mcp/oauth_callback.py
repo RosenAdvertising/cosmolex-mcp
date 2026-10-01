@@ -41,15 +41,29 @@ def redirect_code(response: str, redirect_uri: str, expected_state: str) -> str:
         raise ValueError(message) from None
 
 
+def _callback_path(path: str) -> str:
+    """Require an unchanged, single-slash origin-form callback path."""
+    if (
+        not path.startswith("/")
+        or path.startswith("//")
+        or "?" in path
+        or "#" in path
+        or "\\" in path
+        or any(ord(c) <= 32 for c in path)
+    ):
+        raise ValueError
+    return path
+
+
 def validate_redirect(redirect_uri: str) -> None:
     try:
         url = urlsplit(redirect_uri)
+        _callback_path(url.path)
         if (
             url.username is not None
             or url.password is not None
-            or url.query
-            or url.fragment
-            or not url.path
+            or "?" in redirect_uri
+            or "#" in redirect_uri
             or any(ord(c) <= 32 for c in redirect_uri)
             or "\\" in redirect_uri
         ):
@@ -79,8 +93,7 @@ class LoopbackCallback:
             def do_GET(self):
                 try:
                     # Only an origin-form request for the registered callback is valid.
-                    if not self.path.startswith("/") or self.path.startswith("//"):
-                        raise ValueError
+                    _callback_path(self.path.partition("?")[0])
                     parsed = urlsplit(owner.redirect_uri)
                     code = redirect_code(
                         f"{parsed.scheme}://{parsed.netloc}{self.path}",

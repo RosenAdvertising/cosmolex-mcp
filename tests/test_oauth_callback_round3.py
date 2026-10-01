@@ -38,6 +38,9 @@ def configure(monkeypatch):
         "http://[::1]:8124/callback",
         "https://127.0.0.1:8124/callback",
         "http://127.0.0.1:8124/callback?query=1",
+        "http://127.0.0.1:8124//path",
+        "http://127.0.0.1:8124/path?",
+        "http://127.0.0.1:8124/path#",
     ],
 )
 def test_real_setup_refuses_unowned_or_unsupported_callback(
@@ -75,13 +78,16 @@ def test_real_setup_bind_failure_does_not_advertise_authorization(configure, cap
     assert "could not receive a valid OAuth callback" in captured.out + captured.err
 
 
+@pytest.mark.parametrize("callback_path", ["/callback", "/custom/oauth/return"])
 @pytest.mark.parametrize("returned_state", ["matching", "wrong", "missing"])
-def test_real_setup_http_callback_end_to_end(configure, monkeypatch, returned_state):
+def test_real_setup_http_callback_end_to_end(
+    configure, monkeypatch, returned_state, callback_path
+):
     # Allocate an unused local port, then let the real setup listener bind it.
     with socket.socket() as available:
         available.bind(("127.0.0.1", 0))
         port = available.getsockname()[1]
-    redirect = f"http://127.0.0.1:{port}/callback"
+    redirect = f"http://127.0.0.1:{port}{callback_path}"
     exchange = configure(redirect)
     original_receive = oauth_callback.LoopbackCallback.receive
     listeners = []
@@ -103,7 +109,7 @@ def test_real_setup_http_callback_end_to_end(configure, monkeypatch, returned_st
             )
         connection = HTTPConnection("127.0.0.1", port, timeout=3)
         try:
-            connection.request("GET", "/callback?" + urlencode(query))
+            connection.request("GET", callback_path + "?" + urlencode(query))
             response = connection.getresponse()
             response.read()
             assert response.status == (200 if returned_state == "matching" else 400)
