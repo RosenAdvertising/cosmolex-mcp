@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cosmolex-mcp"
-version = "0.2.1"
+version = "0.3.0"
 description = "MCP server for CosmoLex — ProfitSolv LCS /v1 Integration API (scoped OAuth)"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,8 +24,8 @@ dev = [
 
 [project.scripts]
 cosmolex-mcp = "cosmolex_mcp.server:main"
-cosmolex-mcp-setup = "cosmolex_mcp.setup.oauth_flow:main"
-cosmolex-mcp-verify = "cosmolex_mcp.setup.verify:main"
+cosmolex-mcp-setup = "cosmolex_mcp.cli:setup_main"
+cosmolex-mcp-verify = "cosmolex_mcp.cli:verify_main"
 
 [project.urls]
 Homepage = "https://github.com/RosenAdvertising/cosmolex-mcp"

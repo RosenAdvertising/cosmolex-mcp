@@ -417,7 +417,9 @@ def test_id_path_segment_is_validated_before_requests_prepares_url(monkeypatch):
 
     def request(method, url, **kwargs):
         request_kwargs = {
-            key: value for key, value in kwargs.items() if key not in {"timeout", "allow_redirects"}
+            key: value
+            for key, value in kwargs.items()
+            if key not in {"timeout", "allow_redirects"}
         }
         captured["url"] = requests.Request(method, url, **request_kwargs).prepare().url
         response = requests.Response()
