@@ -41,7 +41,7 @@ filters elsewhere, so those tools are pagination-only and never advertise a filt
 that returns unfiltered data. This filter set and the create→read→update→delete
 round-trips are INHERITED from the Rocket Matter live verification of this same /v1
 API; the blank CosmoLex sandbox firm could not exercise filtered reads or write
-round-trips directly (flagged UNVERIFIED-for-CosmoLex in the rebuild report).
+round-trips directly; those behaviors remain unverified for CosmoLex.
 
 COVERAGE: the LCS ``/v1`` API is narrower than the NextGen ``/api/v2`` set the
 previous CosmoLex build used. Resources it does NOT expose (timekeepers, firm
@@ -49,20 +49,131 @@ summary, banks, chart of accounts, accounts-payable, lookups, document actions,
 tasks, timers, calendar, tags, trust, rates, firm roles, tax/discount, phone
 messages, internal chat, workflow, reports, recurring billing, matter templates,
 court rules) are kept as **fail-loud stubs** via :meth:`_not_in_v1` — they raise a
-clear "not in the LCS /v1 API" error instead of silently returning nothing, pending
-Toby's keep/drop call. See the module ``COVERAGE_DELTA`` list and the wiki page
-``Cosmolex MCP``.
+clear "not in the LCS /v1 API" error instead of silently returning nothing. See
+the module ``COVERAGE_DELTA`` list.
 """
 
 import json
+import logging
 import os
+import re
+import secrets
 import time
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import requests
+from mcp.server.mcpserver.exceptions import ToolError
 
 from cosmolex_mcp import credentials
+from cosmolex_mcp.private_storage import atomic_private_write
+from cosmolex_mcp.endpoint_validation import LCS_HOSTS, vendor_endpoint
+
+logger = logging.getLogger(__name__)
+
+
+def _path_id(value, parameter: str) -> str:
+    """Validate a plain identifier before URL quoting or any HTTP request."""
+    expected = (
+        "a non-empty plain identifier (ASCII letters, digits, -, _, ., ~); not . or .."
+    )
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (str, int))
+        or str(value) in {".", ".."}
+        or re.fullmatch(r"[A-Za-z0-9._~-]+", str(value)) is None
+    ):
+        raise InvalidToolArgument(parameter, expected)
+    return quote(str(value), safe="")
+
+
+class SafeToolFailure(ToolError):
+    """Known failure with deliberately safe client text and fixed log reason."""
+
+    reason = "known_failure"
+
+
+class MissingConfiguration(SafeToolFailure):
+    reason = "missing_configuration"
+
+
+class AuthorizationRejected(SafeToolFailure, RuntimeError):
+    reason = "authorization_rejected"
+
+
+class VendorHTTPFailure(SafeToolFailure):
+    reason = "vendor_http_failure"
+
+    def __init__(self, status: int, vendor_reason: str = ""):
+        self.status = status
+        # Strict allowlist: vendor-controlled text is never copied through.
+        safe_reasons = {
+            "invalid_request": "invalid request",
+            "invalid_grant": "authorization was rejected",
+            "insufficient_scope": "permission was denied",
+            "not_found": "resource was not found",
+            "validation_error": "request validation failed",
+            "internal_error": "vendor service error",
+        }
+        self.vendor_reason = safe_reasons.get(vendor_reason, "request failed")
+        detail = f": {self.vendor_reason}" if self.vendor_reason else ""
+        super().__init__(f"CosmoLex returned HTTP {status}{detail}.")
+
+
+class RateLimited(SafeToolFailure):
+    reason = "rate_limited"
+
+    def __init__(self, retry_after: int | None = None):
+        self.retry_after = (
+            retry_after
+            if retry_after is not None and 0 <= retry_after <= 999999999
+            else None
+        )
+        hint = (
+            f" Retry after {self.retry_after} seconds."
+            if self.retry_after is not None
+            else " Retry after a short pause."
+        )
+        super().__init__("CosmoLex rate limit reached." + hint)
+
+
+class TransportFailure(SafeToolFailure):
+    reason = "transport_failure"
+
+
+class InvalidVendorResponse(SafeToolFailure):
+    reason = "invalid_vendor_response"
+
+    def __init__(self):
+        super().__init__(
+            "CosmoLex returned an unreadable response. Check the result in CosmoLex before retrying."
+        )
+
+
+class InvalidToolArgument(SafeToolFailure, ValueError):
+    reason = "invalid_argument"
+
+    def __init__(self, argument: str, expected: str):
+        self.argument = argument
+        self.expected = expected
+        super().__init__(f"Invalid argument '{argument}': expected {expected}.")
+
+
+class RecordNotFound(SafeToolFailure):
+    reason = "not_found"
+
+
+class UnsupportedCapability(SafeToolFailure):
+    reason = "unsupported_capability"
+
+
+class InvalidJSONInput(SafeToolFailure, ValueError):
+    reason = "invalid_argument"
+
+
+class TransactionScopeRequired(SafeToolFailure, RuntimeError):
+    reason = "invalid_argument"
+
 
 # Resolve credentials through the pluggable store (OS keyring -> env -> .env file).
 # The LCS /v1 OAuth model needs the app's API key + the OAuth client_id/secret; the
@@ -83,33 +194,25 @@ credentials.load_into_environ(
 # production = law.cosmolex.com. Override with COSMOLEX_BASE_URL.
 OAUTH_BASE = os.environ.get("COSMOLEX_BASE_URL", "https://sandbox.cosmolex.com")
 
-# LCS Integration data host (the ProfitSolv Azure app). This is a DIFFERENT host
-# from the OAuth host — the earlier "/v1 is dead on NextGen CosmoLex" misdiagnosis
-# came from calling /v1 on the cosmolex.com product host (an empty-200 / 403
-# catch-all), instead of this Azure data host. The default is the sandbox host; the
-# production data host is provisioned per-firm and set via COSMOLEX_API_BASE_URL.
+# LCS data requests use the ProfitSolv Azure host, separate from OAuth.
+# The product host may return an empty 200 or 403 for /v1 requests.
+# The default data host is the sandbox; set COSMOLEX_API_BASE_URL to the
+# production data host provisioned for the firm.
 API_BASE = os.environ.get(
     "COSMOLEX_API_BASE_URL",
     "https://lcs-developer-api-profi-sandbox-gncndgfccdgxdtff.centralus-01.azurewebsites.net",
 )
 
+OAUTH_BASE = vendor_endpoint(OAUTH_BASE, {"sandbox.cosmolex.com", "law.cosmolex.com"})
+API_BASE = vendor_endpoint(API_BASE, LCS_HOSTS)
+
 TOKEN_URL = f"{OAUTH_BASE}/api/ext/auth/token"
 AUTHORIZE_URL = f"{OAUTH_BASE}/OAuth/authorize"
 
-# Registered redirect URI for the OAuth app — a hard constant, NOT env-derived, so the
-# setup wizard can detect a stored/overridden redirect that differs from what the app
-# will actually accept (a mismatch breaks consent). The CosmoLex sandbox app registered
-# ``https://localhost:8770/callback``; setup uses a manual copy-paste of the ``code``
-# from the address bar (the browser lands on localhost:8770, which need not be served,
-# and the ``code`` query param is copied back).
-REGISTERED_REDIRECT_URI = "https://localhost:8770/callback"
-
-# Effective redirect for building the consent URL: an explicit COSMOLEX_REDIRECT_URI
-# override wins (for an app that registered a different redirect), else the registered
-# constant above.
-DEFAULT_REDIRECT_URI = (
-    os.environ.get("COSMOLEX_REDIRECT_URI") or REGISTERED_REDIRECT_URI
-)
+# The firm must register this exact HTTP loopback redirect with the vendor.
+# Setup binds the listener before advertising authorization and validates overrides.
+REGISTERED_REDIRECT_URI = "http://127.0.0.1:8770/callback"
+DEFAULT_REDIRECT_URI = REGISTERED_REDIRECT_URI
 
 CONFIG_DIR = Path.home() / ".cosmolex-mcp"
 TOKEN_FILE = CONFIG_DIR / "tokens.json"
@@ -138,7 +241,7 @@ _ERROR_ENVELOPE_KEYS = (
 )
 
 # Tools whose capability the LCS /v1 API does not expose (kept as fail-loud stubs).
-# Surfaced for Toby's keep/drop call — NOT silently dropped.
+# Surfaced as unsupported capabilities — NOT silently dropped.
 COVERAGE_DELTA = [
     "list_timekeepers (billable-time summary)",
     "get_firm_summary",
@@ -166,14 +269,7 @@ def _load_tokens() -> dict:
 
 
 def _save_tokens(tokens: dict) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        CONFIG_DIR.chmod(0o700)
-    except OSError:
-        pass
-    with open(TOKEN_FILE, "w") as f:
-        json.dump(tokens, f, indent=2)
-    os.chmod(TOKEN_FILE, 0o600)
+    atomic_private_write(TOKEN_FILE, json.dumps(tokens, indent=2))
 
 
 def _token_record(data: dict, prev: dict | None = None) -> dict:
@@ -187,7 +283,8 @@ def _token_record(data: dict, prev: dict | None = None) -> dict:
     prev = prev or {}
     access = data.get("access_token")
     if not access:
-        raise RuntimeError(f"Token response had no access_token: {str(data)[:200]}")
+        logger.warning("oauth_token_response_rejected reason=missing_access_token")
+        raise AuthorizationRejected("Token response had no access_token")
     return {
         "access_token": access,
         "refresh_token": data.get("refresh_token") or prev.get("refresh_token", ""),
@@ -201,7 +298,9 @@ def _token_record(data: dict, prev: dict | None = None) -> dict:
 
 
 def build_authorize_url(
-    redirect_uri: str | None = None, client_id: str | None = None
+    redirect_uri: str | None = None,
+    client_id: str | None = None,
+    state: str | None = None,
 ) -> str:
     """Build the browser consent URL the user opens to authorize the integration."""
     client_id = client_id or os.environ.get("COSMOLEX_CLIENT_ID", "")
@@ -211,6 +310,7 @@ def build_authorize_url(
             "client_id": client_id,
             "redirect_uri": redirect_uri,
             "response_type": "code",
+            "state": state or secrets.token_urlsafe(32),
         }
     )
     return f"{AUTHORIZE_URL}?{query}"
@@ -235,27 +335,38 @@ def exchange_code(
     client_id = client_id or os.environ.get("COSMOLEX_CLIENT_ID", "")
     client_secret = client_secret or os.environ.get("COSMOLEX_CLIENT_SECRET", "")
     if not (client_id and client_secret):
-        raise RuntimeError(
-            "COSMOLEX_CLIENT_ID and COSMOLEX_CLIENT_SECRET are required to "
-            "exchange the authorization code. Run: cosmolex-mcp-setup"
+        logger.warning("oauth_code_exchange_rejected reason=missing_app_credentials")
+        raise MissingConfiguration(
+            "COSMOLEX_CLIENT_ID and COSMOLEX_CLIENT_SECRET are required. "
+            "Run: cosmolex-mcp-setup."
         )
-    resp = requests.post(
-        TOKEN_URL,
-        data={
-            "grant_type": "authorization_code",
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code": code,
-        },
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=30,
-    )
+    try:
+        resp = requests.post(
+            TOKEN_URL,
+            data={
+                "grant_type": "authorization_code",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "code": code,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=30,
+            allow_redirects=False,
+        )
+    except requests.RequestException:
+        raise TransportFailure(
+            "CosmoLex authorization request outcome is unknown. Check whether authorization completed before retrying."
+        ) from None
     if not resp.ok:
-        raise RuntimeError(
-            f"Authorization-code exchange failed ({resp.status_code}): "
-            f"{resp.text[:300]}"
+        logger.warning(
+            "oauth_code_exchange_rejected reason=upstream_error status=%s",
+            resp.status_code,
         )
-    tokens = _token_record(resp.json())
+        raise LCSClient._http_failure(resp)
+    try:
+        tokens = _token_record(resp.json())
+    except (requests.exceptions.JSONDecodeError, ValueError, TypeError, KeyError):
+        raise InvalidVendorResponse() from None
     if save:
         _save_tokens(tokens)
     return tokens
@@ -277,12 +388,14 @@ class LCSClient:
         self._client_secret = os.environ.get("COSMOLEX_CLIENT_SECRET", "")
         self._tokens = _load_tokens()
         if not self._tokens.get("access_token"):
-            raise RuntimeError(
-                "No CosmoLex OAuth tokens found. Run: cosmolex-mcp-setup"
+            logger.warning("client_initialization_rejected reason=missing_oauth_tokens")
+            raise MissingConfiguration(
+                "No CosmoLex connection is configured. Run cosmolex-mcp-setup to connect, then restart the MCP server."
             )
         if not self._api_key:
-            raise RuntimeError(
-                "COSMOLEX_API_KEY is not set. Run: cosmolex-mcp-setup"
+            logger.warning("client_initialization_rejected reason=missing_api_key")
+            raise MissingConfiguration(
+                "COSMOLEX_API_KEY is not set. Run cosmolex-mcp-setup, then restart the MCP server."
             )
 
     # ── Auth ─────────────────────────────────────────────────────────────────
@@ -296,29 +409,51 @@ class LCSClient:
         """Get a fresh access token via the long-lived refresh token (no password)."""
         refresh_token = self._tokens.get("refresh_token")
         if not refresh_token:
-            raise RuntimeError("No refresh_token cached. Run: cosmolex-mcp-setup")
+            logger.warning("oauth_refresh_rejected reason=missing_refresh_token")
+            raise MissingConfiguration(
+                "No refresh token is configured. Run cosmolex-mcp-setup, then restart the MCP server."
+            )
         if not (self._client_id and self._client_secret):
-            raise RuntimeError(
-                "COSMOLEX_CLIENT_ID / COSMOLEX_CLIENT_SECRET not set. "
-                "Run: cosmolex-mcp-setup"
+            logger.warning("oauth_refresh_rejected reason=missing_app_credentials")
+            raise MissingConfiguration(
+                "COSMOLEX_CLIENT_ID and COSMOLEX_CLIENT_SECRET are required. "
+                "Run cosmolex-mcp-setup, then restart the MCP server."
             )
-        resp = requests.post(
-            TOKEN_URL,
-            data={
-                "grant_type": "refresh_token",
-                "client_id": self._client_id,
-                "client_secret": self._client_secret,
-                "refresh_token": refresh_token,
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=30,
-        )
+        try:
+            resp = requests.post(
+                TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": self._client_id,
+                    "client_secret": self._client_secret,
+                    "refresh_token": refresh_token,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=30,
+                allow_redirects=False,
+            )
+        except requests.RequestException:
+            raise TransportFailure(
+                "CosmoLex authorization request outcome is unknown. Check whether authorization completed before retrying."
+            ) from None
         if not resp.ok:
-            raise RuntimeError(
-                f"Token refresh failed ({resp.status_code}): {resp.text[:200]}. "
-                "The refresh token may be revoked — re-run cosmolex-mcp-setup."
+            logger.warning(
+                "oauth_refresh_rejected reason=upstream_error status=%s",
+                resp.status_code,
             )
-        self._tokens = _token_record(resp.json(), self._tokens)
+            if resp.status_code == 403:
+                raise AuthorizationRejected(
+                    "CosmoLex access denied: the connected account lacks permission for this action (or the authorization expired; re-run cosmolex-mcp-setup if so)."
+                )
+            if resp.status_code in (400, 401):
+                raise AuthorizationRejected(
+                    "CosmoLex authorization expired or was rejected. Re-run cosmolex-mcp-setup to reconnect."
+                )
+            raise self._http_failure(resp)
+        try:
+            self._tokens = _token_record(resp.json(), self._tokens)
+        except (requests.exceptions.JSONDecodeError, ValueError, TypeError, KeyError):
+            raise InvalidVendorResponse() from None
         _save_tokens(self._tokens)
 
     def _headers(self) -> dict:
@@ -341,19 +476,10 @@ class LCSClient:
         the server (token rejected early) it refreshes once and retries. Returns the
         raw ``Response`` so callers can treat 404 specially (see :meth:`_detail`).
         """
-        if not self._token_valid():
-            self._refresh()
-        url = self._url(path)
-        resp = self.session.request(
-            method,
-            url,
-            params=params,
-            json=body,
-            headers=self._headers(),
-            timeout=_HTTP_TIMEOUT,
-        )
-        if resp.status_code == 401:
-            self._refresh()
+        try:
+            if not self._token_valid():
+                self._refresh()
+            url = self._url(path)
             resp = self.session.request(
                 method,
                 url,
@@ -361,19 +487,99 @@ class LCSClient:
                 json=body,
                 headers=self._headers(),
                 timeout=_HTTP_TIMEOUT,
+                allow_redirects=False,
             )
-        return resp
+            if resp.status_code == 401:
+                self._refresh()
+                resp = self.session.request(
+                    method,
+                    url,
+                    params=params,
+                    json=body,
+                    headers=self._headers(),
+                    timeout=_HTTP_TIMEOUT,
+                    allow_redirects=False,
+                )
+            return resp
+        except requests.exceptions.JSONDecodeError:
+            raise InvalidVendorResponse() from None
+        except requests.RequestException:
+            if method.upper() == "GET":
+                message = (
+                    "CosmoLex request did not complete. Check connectivity and retry."
+                )
+            else:
+                message = "CosmoLex request outcome is unknown. Check whether the operation completed in CosmoLex before retrying."
+            raise TransportFailure(message) from None
 
     @staticmethod
     def _json_or_raise(resp: requests.Response):
         """Parse a JSON body, or raise a loud error on a non-2xx response."""
         if not resp.ok:
-            raise RuntimeError(
-                f"Cosmolex /v1 error {resp.status_code}: {resp.text[:400]}"
+            logger.warning(
+                "vendor_response_rejected reason=http_error status=%s",
+                resp.status_code,
             )
+            raise LCSClient._http_failure(resp)
         if not resp.content:
             return {}
-        return resp.json()
+        try:
+            data = resp.json()
+        except ValueError:
+            raise InvalidVendorResponse() from None
+        if LCSClient._is_failed_response(data):
+            logger.warning(
+                "vendor_response_rejected reason=error_envelope status=%s",
+                resp.status_code,
+            )
+            raise VendorHTTPFailure(resp.status_code, "internal_error")
+        return data
+
+    @staticmethod
+    def _is_failed_response(data) -> bool:
+        return isinstance(data, dict) and (
+            data.get("success") is False
+            or (
+                data.get("success") is None
+                and bool(data.get("error") or data.get("errors"))
+            )
+        )
+
+    @staticmethod
+    def _http_failure(resp: requests.Response) -> SafeToolFailure:
+        if resp.status_code == 429:
+            retry_after = None
+            try:
+                value = int(resp.headers.get("Retry-After", ""))
+                if 0 <= value <= 999999999:
+                    retry_after = value
+            except (TypeError, ValueError):
+                pass
+            return RateLimited(retry_after)
+        if resp.status_code == 401:
+            return AuthorizationRejected(
+                "CosmoLex authorization expired or was rejected. Re-run cosmolex-mcp-setup to reconnect."
+            )
+        if resp.status_code == 403:
+            return AuthorizationRejected(
+                "CosmoLex access denied: the connected account lacks permission for this action (or the authorization expired; re-run cosmolex-mcp-setup if so)."
+            )
+        if resp.status_code == 404:
+            return RecordNotFound(
+                "CosmoLex resource was not found. Check the requested record."
+            )
+        reason = ""
+        # Read only a generic vendor code from a small allowlist; never include
+        # response text, detail fields, URLs, or vendor supplied messages.
+        try:
+            payload = resp.json()
+            if isinstance(payload, dict):
+                candidate = payload.get("code") or payload.get("error")
+                if isinstance(candidate, str) and len(candidate) <= 40:
+                    reason = candidate.lower()
+        except (ValueError, TypeError):
+            pass
+        return VendorHTTPFailure(resp.status_code, reason)
 
     # ── Generic resource operations ──────────────────────────────────────────
 
@@ -381,11 +587,24 @@ class LCSClient:
         """GET a list endpoint -> the paginated envelope (or bare list for documents).
 
         ``page`` / ``pageSize`` are the live-confirmed pagination params; extra
-        non-None query params (filters) pass through unchanged.
+        non-None query params (filters) pass through unchanged. The response is
+        defensively capped even if an endpoint ignores ``pageSize``.
         """
+        if page < 1:
+            logger.warning("list_request_rejected reason=page_below_minimum")
+            raise InvalidToolArgument("page", "an integer greater than or equal to 1")
+        if not 1 <= page_size <= 200:
+            logger.warning("list_request_rejected reason=page_size_out_of_range")
+            raise InvalidToolArgument("page_size", "an integer from 1 to 200")
         query: dict = {"page": page, "pageSize": page_size}
         query.update({k: v for k, v in params.items() if v is not None})
-        return self._json_or_raise(self._send("GET", resource, params=query))
+        data = self._json_or_raise(self._send("GET", resource, params=query))
+        if isinstance(data, list):
+            return data[:page_size]
+        if isinstance(data, dict) and isinstance(data.get("items"), list):
+            data = dict(data)
+            data["items"] = data["items"][:page_size]
+        return data
 
     @staticmethod
     def _is_error_envelope(data: dict) -> bool:
@@ -399,10 +618,10 @@ class LCSClient:
             return True
         return any(data.get(k) for k in _ERROR_ENVELOPE_KEYS)
 
-    def _detail(self, resource: str, record_id) -> dict | None:
+    def _detail(self, resource: str, record_id) -> dict:
         """GET a single record by id via the RESTful item route.
 
-        Returns the record dict, or ``None`` if it does not exist. Tolerates a known
+        Returns the record dict, or raises RecordNotFound if it does not exist. Tolerates a known
         server quirk where an existing record is occasionally returned with a 404
         status but a populated record body. The "found" path is strict: a 2xx with a
         dict body, or a 404 whose body is unmistakably the record — a truthy ``id``
@@ -413,7 +632,7 @@ class LCSClient:
         corrupt data). The bias is deliberate: a real record misjudged not-found fails
         loudly in :meth:`_update`; the inverse corrupts.
         """
-        resp = self._send("GET", f"{resource}/{record_id}")
+        resp = self._send("GET", f"{resource}/{_path_id(record_id, 'record_id')}")
         data = None
         if resp.content:
             try:
@@ -421,7 +640,15 @@ class LCSClient:
             except ValueError:
                 data = None
         if resp.ok:
-            return data if isinstance(data, dict) else None
+            if isinstance(data, dict):
+                if self._is_failed_response(data):
+                    logger.warning(
+                        "detail_response_rejected reason=error_envelope status=%s",
+                        resp.status_code,
+                    )
+                    raise VendorHTTPFailure(resp.status_code, "internal_error")
+                return data
+            raise InvalidVendorResponse()
         if resp.status_code == 404:
             # Known quirk: an existing record is occasionally returned WITH a 404
             # status but a full record body. Accept that ONLY when the body is a real
@@ -433,10 +660,13 @@ class LCSClient:
                 and not self._is_error_envelope(data)
             ):
                 return data
-            return None
-        raise RuntimeError(
-            f"Cosmolex /v1 error {resp.status_code}: {resp.text[:400]}"
+            logger.warning("detail_response_rejected reason=not_found")
+            raise RecordNotFound(f"{resource} record was not found.")
+        logger.warning(
+            "detail_response_rejected reason=http_error status=%s",
+            resp.status_code,
         )
+        raise self._http_failure(resp)
 
     def _create(self, resource: str, body: dict) -> dict:
         """POST to a collection -> the created record (201)."""
@@ -452,12 +682,22 @@ class LCSClient:
         ``400 "Name cannot be empty"``), so the current record must be merged in.
         ``method`` is ``PUT`` for most resources, ``PATCH`` for invoices.
         """
+        if not fields:
+            raise InvalidToolArgument("fields", "a non-empty object")
+        record_id = _path_id(record_id, "record_id")
         current = self._detail(resource, record_id)
         if current is None:
-            raise RuntimeError(f"{resource} {record_id} not found; cannot update.")
+            logger.warning(
+                "update_rejected reason=record_not_found resource=%s", resource
+            )
+            raise RecordNotFound(
+                f"{resource} record was not found; it cannot be updated."
+            )
         merged = {**current, **fields}
         return self._json_or_raise(
-            self._send(method, f"{resource}/{record_id}", body=merged)
+            self._send(
+                method, f"{resource}/{_path_id(record_id, 'record_id')}", body=merged
+            )
         )
 
     def _delete(self, resource: str, record_id) -> dict:
@@ -467,14 +707,16 @@ class LCSClient:
         routes instead return a 200 whose BODY reports the real outcome — a
         ``{"success": false, ...}`` (or an ``error``/``errors`` payload) there is a
         FAILURE despite the 2xx. The body is read so that is surfaced as an error
-        (Rule 12 — never a false success) rather than reported as deleted; only a body
+        (never report a false success) rather than reported as deleted; only a body
         that does not contradict success returns ``{"success": True}``.
         """
-        resp = self._send("DELETE", f"{resource}/{record_id}")
+        resp = self._send("DELETE", f"{resource}/{_path_id(record_id, 'record_id')}")
         if not resp.ok:
-            raise RuntimeError(
-                f"Cosmolex /v1 error {resp.status_code}: {resp.text[:400]}"
+            logger.warning(
+                "delete_rejected reason=http_error status=%s",
+                resp.status_code,
             )
+            raise self._http_failure(resp)
         if not resp.content:
             return {"success": True}
         try:
@@ -489,24 +731,22 @@ class LCSClient:
                 and (data.get("error") or data.get("errors"))
             )
         ):
-            raise RuntimeError(
-                f"Cosmolex /v1 delete reported failure despite HTTP "
-                f"{resp.status_code}: {str(data)[:400]}"
+            logger.warning(
+                "delete_rejected reason=error_envelope status=%s",
+                resp.status_code,
             )
+            raise VendorHTTPFailure(resp.status_code, "internal_error")
         return {"success": True}
 
-    def _not_in_v1(self, capability: str) -> RuntimeError:
+    def _not_in_v1(self, capability: str) -> SafeToolFailure:
         """Standard fail-loud error for a capability the LCS /v1 API lacks.
 
         Never returns a false success — the tool raises so the gap is visible
-        (Rule 12). Kept registered for Toby's keep/drop call; see ``COVERAGE_DELTA``.
+        Kept registered to report the unsupported API capability; see ``COVERAGE_DELTA``.
         """
-        return RuntimeError(
-            f"'{capability}' is not available in the ProfitSolv LCS /v1 Integration "
-            "API (the scoped-OAuth data API this MCP uses). It existed on the legacy "
-            "/api/v2 session API, which trips CosmoLex's single-session limit "
-            "and logs the user out — so it was intentionally dropped. This tool fails "
-            "loudly instead of reporting a false success."
+        logger.warning("capability_rejected reason=not_in_vendor_api")
+        return UnsupportedCapability(
+            f"{capability} is not available in the ProfitSolv LCS /v1 Integration API."
         )
 
     # ═════════════════════════════ Matters ══════════════════════════════════
@@ -534,16 +774,16 @@ class LCSClient:
         )
 
     def get_matter(self, matter_id: str) -> dict | None:
-        return self._detail("matters", matter_id)
+        return self._detail("matters", _path_id(matter_id, "matter_id"))
 
     def create_matter(self, **fields) -> dict:
         return self._create("matters", fields)
 
     def update_matter(self, matter_id: str, **fields) -> dict:
-        return self._update("matters", matter_id, fields)
+        return self._update("matters", _path_id(matter_id, "matter_id"), fields)
 
     def delete_matter(self, matter_id: str) -> dict:
-        return self._delete("matters", matter_id)
+        return self._delete("matters", _path_id(matter_id, "matter_id"))
 
     # ═════════════════════════════ Clients ══════════════════════════════════
 
@@ -569,7 +809,7 @@ class LCSClient:
         )
 
     def get_client(self, client_id: str) -> dict | None:
-        return self._detail("clients", client_id)
+        return self._detail("clients", _path_id(client_id, "client_id"))
 
     def create_client(self, **fields) -> dict:
         """Create a client (``POST /v1/clients``). Only ``name`` is required
@@ -577,10 +817,10 @@ class LCSClient:
         return self._create("clients", fields)
 
     def update_client(self, client_id: str, **fields) -> dict:
-        return self._update("clients", client_id, fields)
+        return self._update("clients", _path_id(client_id, "client_id"), fields)
 
     def delete_client(self, client_id: str) -> dict:
-        return self._delete("clients", client_id)
+        return self._delete("clients", _path_id(client_id, "client_id"))
 
     # ═════════════════════════════ Contacts ═════════════════════════════════
 
@@ -589,16 +829,16 @@ class LCSClient:
         return self._list("contacts", page=page, page_size=page_size)
 
     def get_contact(self, contact_id: str) -> dict | None:
-        return self._detail("contacts", contact_id)
+        return self._detail("contacts", _path_id(contact_id, "contact_id"))
 
     def create_contact(self, **fields) -> dict:
         return self._create("contacts", fields)
 
     def update_contact(self, contact_id: str, **fields) -> dict:
-        return self._update("contacts", contact_id, fields)
+        return self._update("contacts", _path_id(contact_id, "contact_id"), fields)
 
     def delete_contact(self, contact_id: str) -> dict:
-        return self._delete("contacts", contact_id)
+        return self._delete("contacts", _path_id(contact_id, "contact_id"))
 
     # ════════════════════════════ Time Entries ══════════════════════════════
 
@@ -619,16 +859,18 @@ class LCSClient:
         )
 
     def get_time_entry(self, time_entry_id: str) -> dict | None:
-        return self._detail("time-entries", time_entry_id)
+        return self._detail("time-entries", _path_id(time_entry_id, "time_entry_id"))
 
     def create_time_entry(self, **fields) -> dict:
         return self._create("time-entries", fields)
 
     def update_time_entry(self, time_entry_id: str, **fields) -> dict:
-        return self._update("time-entries", time_entry_id, fields)
+        return self._update(
+            "time-entries", _path_id(time_entry_id, "time_entry_id"), fields
+        )
 
     def delete_time_entry(self, time_entry_id: str) -> dict:
-        return self._delete("time-entries", time_entry_id)
+        return self._delete("time-entries", _path_id(time_entry_id, "time_entry_id"))
 
     # ═════════════════════════════ Expenses ═════════════════════════════════
     # Note the SINGULAR /v1 path: ``/v1/expense`` (plural ``/v1/expenses`` 404s).
@@ -643,16 +885,16 @@ class LCSClient:
         return self._list("expense", page=page, page_size=page_size)
 
     def get_expense(self, expense_id: str) -> dict | None:
-        return self._detail("expense", expense_id)
+        return self._detail("expense", _path_id(expense_id, "expense_id"))
 
     def create_expense(self, **fields) -> dict:
         return self._create("expense", fields)
 
     def update_expense(self, expense_id: str, **fields) -> dict:
-        return self._update("expense", expense_id, fields)
+        return self._update("expense", _path_id(expense_id, "expense_id"), fields)
 
     def delete_expense(self, expense_id: str) -> dict:
-        return self._delete("expense", expense_id)
+        return self._delete("expense", _path_id(expense_id, "expense_id"))
 
     # ═════════════════════════════ Invoices ═════════════════════════════════
     # Update verb is PATCH (not PUT) for invoices, per the live OPTIONS probe.
@@ -662,19 +904,21 @@ class LCSClient:
         return self._list("invoices", page=page, page_size=page_size)
 
     def get_invoice(self, invoice_id: str) -> dict | None:
-        return self._detail("invoices", invoice_id)
+        return self._detail("invoices", _path_id(invoice_id, "invoice_id"))
 
     def create_invoice(self, **fields) -> dict:
         """Create an invoice (``POST /v1/invoices``). The required body has not been
-        exercised live (the dev firm has no billable items); the caller supplies the
+        exercised live (the test firm has no billable items); the caller supplies the
         fields and the API's 400 validation names any that are missing."""
         return self._create("invoices", fields)
 
     def update_invoice(self, invoice_id: str, **fields) -> dict:
-        return self._update("invoices", invoice_id, fields, method="PATCH")
+        return self._update(
+            "invoices", _path_id(invoice_id, "invoice_id"), fields, method="PATCH"
+        )
 
     def delete_invoice(self, invoice_id: str) -> dict:
-        return self._delete("invoices", invoice_id)
+        return self._delete("invoices", _path_id(invoice_id, "invoice_id"))
 
     def generate_invoice(self, *args, **kwargs) -> dict:
         raise self._not_in_v1(
@@ -722,10 +966,9 @@ class LCSClient:
         ``bank_id`` must come from the CosmoLex UI.
         """
         if not (matter_id or bank_id):
-            raise RuntimeError(
-                "list_transactions requires matter_id or bank_id — the LCS /v1 "
-                "transactions endpoint has no firm-wide listing, and /v1 exposes no "
-                "bank-enumeration endpoint (get a bankId from the CosmoLex UI)."
+            logger.warning("list_request_rejected reason=missing_transaction_scope")
+            raise TransactionScopeRequired(
+                "list_transactions requires matter_id or bank_id (one of these identifiers)."
             )
         return self._list(
             "transactions",
@@ -736,7 +979,7 @@ class LCSClient:
         )
 
     def get_transaction(self, transaction_id: str) -> dict | None:
-        return self._detail("transactions", transaction_id)
+        return self._detail("transactions", _path_id(transaction_id, "transaction_id"))
 
     def create_transaction(self, **fields) -> dict:
         """Create a bank transaction (``POST /v1/transactions``). Body caller-supplied
@@ -744,10 +987,12 @@ class LCSClient:
         return self._create("transactions", fields)
 
     def update_transaction(self, transaction_id: str, **fields) -> dict:
-        return self._update("transactions", transaction_id, fields)
+        return self._update(
+            "transactions", _path_id(transaction_id, "transaction_id"), fields
+        )
 
     def delete_transaction(self, transaction_id: str) -> dict:
-        return self._delete("transactions", transaction_id)
+        return self._delete("transactions", _path_id(transaction_id, "transaction_id"))
 
     def list_banks(self, *args, **kwargs) -> dict:
         raise self._not_in_v1("list_banks (bank enumeration)")
@@ -788,7 +1033,7 @@ class LCSClient:
         return self._list("users", page=page, page_size=page_size)
 
     def get_user(self, user_id: int) -> dict | None:
-        return self._detail("users", user_id)
+        return self._detail("users", _path_id(user_id, "user_id"))
 
     def list_timekeepers(self, *args, **kwargs) -> dict:
         raise self._not_in_v1(
@@ -833,7 +1078,7 @@ class LCSClient:
         return self._list("text-shortcuts", page=page, page_size=page_size)
 
     def get_text_shortcut(self, shortcut_id: int) -> dict | None:
-        return self._detail("text-shortcuts", shortcut_id)
+        return self._detail("text-shortcuts", _path_id(shortcut_id, "shortcut_id"))
 
     # ═══════════════════════════════ Lookups ════════════════════════════════
     # None of the legacy lookup endpoints exist in the LCS /v1 API (all 404).

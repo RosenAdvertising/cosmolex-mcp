@@ -13,7 +13,7 @@ log you out of your CosmoLex browser session while it runs.
 
 The server exposes **86 MCP tools**. The resources the LCS `/v1` API does not expose
 are kept as **fail-loud stubs** — they return a clear "not in the LCS /v1 API" error
-rather than silently returning nothing, pending a keep/drop decision.
+rather than silently returning nothing.
 
 ## What you can do
 
@@ -43,6 +43,7 @@ rules.
 ## Requirements
 
 - Python 3.10+
+- Python MCP SDK >=2.2,<3 (separate from the MCP protocol revision)
 - Claude Desktop (or any MCP-compatible client)
 - A CosmoLex account **and** a registered OAuth integration (API key + OAuth client
   ID/secret) for the ProfitSolv LCS Integration API
@@ -67,16 +68,19 @@ pip install -e .
 cosmolex-mcp-setup
 ```
 
+Before setup, register **`http://127.0.0.1:8770/callback`** as an OAuth redirect
+with CosmoLex / ProfitSolv. The old HTTPS localhost registration must be changed
+to this HTTP loopback redirect.
+
 The wizard:
 
 1. Stores your integration's **API key**, **OAuth client ID**, and **client secret**
    in your OS keyring (see Credential storage below).
-2. Prints an authorization URL. Open it in your browser (logged in to CosmoLex) and
-   click **Allow**.
-3. Your browser redirects to the app's registered redirect URI
-   (`https://localhost:8770/callback`) with a `?code=...` parameter. The browser may
-   show a connection error — that's fine; just copy the `code` value from the address
-   bar and paste it back into the wizard.
+2. Binds the local callback, then prints an authorization URL. Open it in your
+   browser (logged in to CosmoLex) and click **Allow**. If the port is occupied,
+   setup stops before printing the URL.
+3. Your browser redirects to `http://127.0.0.1:8770/callback`. The listener checks
+   the callback path and session's random `state` before accepting the code.
 4. The wizard exchanges the code for an access token + refresh token, cached at
    `~/.cosmolex-mcp/tokens.json` (chmod 600).
 
@@ -113,12 +117,17 @@ the cross-platform [`keyring`](https://github.com/jaraco/keyring) library:
 | Windows | Credential Manager                       |
 | Linux   | Secret Service (GNOME Keyring / KWallet) |
 
-Secrets are saved under the service name `cosmolex-mcp`. Nothing is written to disk in
-clear text.
+Secrets are saved under the service name `cosmolex-mcp` when a keyring backend is
+available. The file fallback below stores credentials on disk with restricted
+permissions.
 
 **File fallback.** On a host with no keyring backend (e.g. a headless Linux box
 without Secret Service), or if you set `COSMOLEX_MCP_USE_KEYRING=0`, credentials fall
 back to a `~/.cosmolex-mcp/.env` file with `0600` permissions.
+
+On Windows, the file is stored in the user's profile and protected by Windows'
+default per-user access rules. On POSIX, files are created with `0600` permissions
+and writes fail closed if private permissions cannot be established.
 
 **Read order.** Credentials resolve in the order OS keyring → process environment →
 `.env` file.
@@ -156,3 +165,24 @@ provisioned per-firm).
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Setup security
+
+Register the exact `COSMOLEX_REDIRECT_URI` with the vendor (default:
+`http://127.0.0.1:8770/callback`). Overrides must use HTTP and exactly `127.0.0.1`,
+with an explicit port and callback path. `localhost`, IPv6 and external callbacks
+are rejected. Setup binds that address before displaying authorization and receives
+the callback automatically; manual redirect pastes, bare codes, `--code` arguments
+and `COSMOLEX_OAUTH_CODE` are not supported.
+Fallback credentials and tokens are atomically written with `0600` permissions
+established before any secret bytes are written; permission failures stop the write.
+
+OAuth endpoints accept only `https://sandbox.cosmolex.com` and
+`https://law.cosmolex.com`. Data endpoints accept only the exact two ProfitSolv LCS
+hosts in `cosmolex_mcp/endpoint_validation.py`. Endpoints reject userinfo, paths,
+query strings, fragments and non-default ports. No Azure suffix wildcard is used.
+The [CosmoLex host documentation](https://support.cosmolex.com/knowledge-base/access-cosmolex-app/)
+identifies the production product host; the
+[public LCS sandbox Swagger document](https://lcs-developer-api-profi-sandbox-gncndgfccdgxdtff.centralus-01.azurewebsites.net/swagger/v1/swagger.json)
+identifies the LCS gateway. Additional provisioned hosts require verification and
+an explicit allowlist update.
