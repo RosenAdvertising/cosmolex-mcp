@@ -1,4 +1,4 @@
-"""Fleet-canary regressions for list safety and rejection logging."""
+"""Regressions for list safety and rejection logging."""
 
 from __future__ import annotations
 
