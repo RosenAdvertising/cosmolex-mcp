@@ -43,7 +43,7 @@ rules.
 ## Requirements
 
 - Python 3.10+
-- Python MCP SDK >=2.2,<3 (separate from the MCP protocol revision)
+- Python MCP SDK >=2.3,<3 (separate from the MCP protocol revision)
 - Claude Desktop (or any MCP-compatible client)
 - A CosmoLex account **and** a registered OAuth integration (API key + OAuth client
   ID/secret) for the ProfitSolv LCS Integration API
@@ -105,6 +105,30 @@ cosmolex-mcp-verify
   }
 }
 ```
+
+## HTTP mode
+
+Stdio, above, stays the default. Set `COSMOLEX_MCP_TRANSPORT=streamable-http` to serve the same server over stateless Streamable HTTP (MCP 2026-07-28). The endpoint is `POST /mcp`. Vendor credentials come from the same environment variables as stdio, never from the request.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `COSMOLEX_MCP_TRANSPORT` | `stdio` | `stdio` or `streamable-http` |
+| `COSMOLEX_MCP_HOST` | `127.0.0.1` | Bind address. Loopback keeps the SDK's own Host and Origin checks. |
+| `PORT` | `8080` | Bind port. A non-integer stops the process. |
+| `COSMOLEX_MCP_ALLOWED_HOSTS` | unset | Comma-separated Host allowlist. Required when the bind address is not loopback. |
+| `COSMOLEX_MCP_ALLOWED_ORIGINS` | unset | Optional comma-separated Origin allowlist, used with the Host allowlist off loopback. |
+| `COSMOLEX_API_KEY` |  | Vendor API key |
+| `COSMOLEX_CLIENT_ID` |  | OAuth client id |
+| `COSMOLEX_CLIENT_SECRET` |  | OAuth client secret |
+| `COSMOLEX_BASE_URL` | `https://sandbox.cosmolex.com` | OAuth host |
+| `COSMOLEX_API_BASE_URL` | sandbox LCS host | `/v1` data host |
+| `COSMOLEX_REDIRECT_URI` | `http://127.0.0.1:8770/callback` | Setup redirect only |
+
+```bash
+COSMOLEX_MCP_TRANSPORT=streamable-http PORT=8080 cosmolex-mcp
+```
+
+Clients then POST to `http://127.0.0.1:8080/mcp`.
 
 ## Credential storage
 

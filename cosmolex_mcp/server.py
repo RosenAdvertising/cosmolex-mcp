@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Cosmolex MCP server — LCS Integration API tools."""
 
+import asyncio
 import json
 import logging
+import os
+from importlib.metadata import version as distribution_version
 from typing import Annotated
 
 from mcp.server import MCPServer
@@ -11,6 +14,7 @@ from mcp.server.mcpserver.exceptions import (
     ToolError,
     UnexpectedToolError,
 )
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.shared.exceptions import MCPError
 from mcp.types import CallToolResult, TextContent
 from pydantic import BeforeValidator, Field, ValidationError
@@ -23,6 +27,9 @@ from cosmolex_mcp.client import (
 )
 
 logger = logging.getLogger(__name__)
+
+STREAMABLE_HTTP_TRANSPORT = "streamable-http"
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
 def _reject_boolean_path_id(value):
@@ -168,8 +175,14 @@ def _expected_schema_shape(field: str, properties: dict) -> str:
     return "the declared input shape"
 
 
+def _package_version() -> str:
+    return distribution_version("cosmolex-mcp")
+
+
 mcp = SafeErrorMCPServer(
     "cosmolex",
+    title="CosmoLex",
+    version=_package_version(),
     instructions=(
         "Cosmolex legal practice management via the ProfitSolv LCS /v1 Integration "
         "API (scoped OAuth — no password login, so it never logs you out of "
@@ -992,8 +1005,78 @@ def accounts_receivable_review() -> str:
    (Note: Accounts Payable and firm-summary tools are not available in the LCS /v1 API.)"""
 
 
+def _requested_transport() -> str:
+    return os.environ.get("COSMOLEX_MCP_TRANSPORT", "stdio").strip().lower() or "stdio"
+
+
+def _host() -> str:
+    return os.environ.get("COSMOLEX_MCP_HOST", "127.0.0.1").strip() or "127.0.0.1"
+
+
+def _port() -> int:
+    raw = os.environ.get("PORT", "8080").strip() or "8080"
+    try:
+        return int(raw)
+    except ValueError:
+        raise SystemExit(f"PORT must be an integer, got {raw!r}.") from None
+
+
+def _csv_env(name: str) -> list[str]:
+    raw = os.environ.get(name, "")
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _transport_security() -> TransportSecuritySettings | None:
+    """Origin checks are required off loopback; the SDK covers loopback itself."""
+    if _host() in _LOOPBACK_HOSTS:
+        return None
+    allowed_hosts = _csv_env("COSMOLEX_MCP_ALLOWED_HOSTS")
+    if not allowed_hosts:
+        raise SystemExit(
+            "COSMOLEX_MCP_HOST is not loopback; set COSMOLEX_MCP_ALLOWED_HOSTS "
+            "to a comma-separated Host allowlist."
+        )
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed_hosts,
+        allowed_origins=_csv_env("COSMOLEX_MCP_ALLOWED_ORIGINS"),
+    )
+
+
+def create_serve_app():
+    """Stateless Streamable HTTP app. JSON responses stay at the SDK SSE default."""
+    return mcp.streamable_http_app(
+        streamable_http_path="/mcp",
+        host=_host(),
+        stateless_http=True,
+        transport_security=_transport_security(),
+    )
+
+
+async def _serve_streamable_http() -> None:
+    import uvicorn
+
+    config = uvicorn.Config(
+        create_serve_app(),
+        host=_host(),
+        port=_port(),
+        access_log=False,
+    )
+    await uvicorn.Server(config).serve()
+
+
 def main():
-    mcp.run()
+    transport = _requested_transport()
+    if transport == "stdio":
+        mcp.run()
+        return
+    if transport == STREAMABLE_HTTP_TRANSPORT:
+        asyncio.run(_serve_streamable_http())
+        return
+    raise SystemExit(
+        "Unsupported COSMOLEX_MCP_TRANSPORT "
+        f"{transport!r}; expected 'stdio' or '{STREAMABLE_HTTP_TRANSPORT}'."
+    )
 
 
 if __name__ == "__main__":
