@@ -16,7 +16,7 @@ def main() -> int:
     parser.add_argument(
         "--mcp-only",
         action="store_true",
-        help="Accepted for parity with fleet spec guards.",
+        help="Accepted for parity with the other spec guards.",
     )
     parser.parse_args()
 
