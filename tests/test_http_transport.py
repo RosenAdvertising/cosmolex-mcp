@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as distribution_version
 from typing import Any
 
@@ -317,3 +321,107 @@ def test_stateless_lifespan_runs_once_for_the_app_not_per_request(monkeypatch) -
 
     asyncio.run(two_requests())
     assert entries == ["enter"]
+
+
+def test_empty_transport_selects_stdio(monkeypatch) -> None:
+    monkeypatch.setenv("COSMOLEX_MCP_TRANSPORT", "")
+    assert server._requested_transport() == "stdio"
+    monkeypatch.setenv("COSMOLEX_MCP_TRANSPORT", "   ")
+    assert server._requested_transport() == "stdio"
+
+
+def test_empty_host_yields_loopback(monkeypatch) -> None:
+    monkeypatch.setenv("COSMOLEX_MCP_HOST", "")
+    assert server._host() == "127.0.0.1"
+    monkeypatch.setenv("COSMOLEX_MCP_HOST", "   ")
+    assert server._host() == "127.0.0.1"
+
+
+def test_uppercase_localhost_is_non_loopback(monkeypatch) -> None:
+    monkeypatch.setenv("COSMOLEX_MCP_HOST", "LOCALHOST")
+    assert server._host() == "LOCALHOST"
+    monkeypatch.delenv("COSMOLEX_MCP_ALLOWED_HOSTS", raising=False)
+    with pytest.raises(SystemExit) as caught:
+        server.create_serve_app()
+    assert "COSMOLEX_MCP_ALLOWED_HOSTS" in str(caught.value)
+
+
+def test_version_fallback_without_installed_distribution(monkeypatch) -> None:
+    def missing(name: str):
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr(server, "distribution_version", missing)
+    assert server._package_version() == "0.0.0+local"
+
+
+def test_fresh_import_without_installed_distribution() -> None:
+    script = (
+        "import importlib.metadata as md; "
+        "_orig = md.version; "
+        "md.version = lambda name, *a, **k: "
+        "(_ for _ in ()).throw(md.PackageNotFoundError(name)) "
+        "if name == 'cosmolex-mcp' else _orig(name, *a, **k); "
+        "import cosmolex_mcp.server as s; "
+        "print(s._package_version())"
+    )
+    env = {
+        **os.environ,
+        "PYTHON_KEYRING_BACKEND": "keyring.backends.null.Keyring",
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "0.0.0+local"
+
+
+def test_concurrent_refresh_calls_vendor_once(monkeypatch, tmp_path) -> None:
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from cosmolex_mcp import client as client_module
+
+    stale = {"access_token": "old", "refresh_token": "rt", "expires_at": 0}
+    token_file = tmp_path / "tokens.json"
+    token_file.write_text(json.dumps(stale))
+    monkeypatch.setattr(client_module, "TOKEN_FILE", token_file)
+
+    calls: list[int] = []
+
+    def fake_post(url, data=None, **kwargs):
+        calls.append(1)
+        time.sleep(0.3)
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps(
+            {"access_token": "new", "refresh_token": "rt", "expires_in": 1799}
+        ).encode()
+        response.headers["Content-Type"] = "application/json"
+        return response
+
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    def make_client() -> LCSClient:
+        client = object.__new__(LCSClient)
+        client._api_key = "k"
+        client._client_id = "cid"
+        client._client_secret = "cs"
+        client._tokens = dict(stale)
+        client.session = requests.Session()
+        return client
+
+    first, second = make_client(), make_client()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        done_first = pool.submit(first._refresh)
+        done_second = pool.submit(second._refresh)
+        done_first.result(timeout=30)
+        done_second.result(timeout=30)
+
+    assert len(calls) == 1
+    assert first._tokens["access_token"] == "new"
+    assert second._tokens["access_token"] == "new"

@@ -60,6 +60,7 @@ import re
 import secrets
 import time
 from pathlib import Path
+from threading import Lock
 from urllib.parse import quote, urlencode
 
 import requests
@@ -70,6 +71,12 @@ from cosmolex_mcp.private_storage import atomic_private_write
 from cosmolex_mcp.endpoint_validation import LCS_HOSTS, vendor_endpoint
 
 logger = logging.getLogger(__name__)
+
+# Serialise OAuth refresh across concurrent HTTP requests: every request builds a
+# fresh client from the same token file, so parallel 401s would otherwise redeem
+# the same refresh token twice. The lock holder re-reads the file first so a
+# second caller reuses the first caller's new token instead of refreshing again.
+_TOKEN_REFRESH_LOCK = Lock()
 
 
 def _path_id(value, parameter: str) -> str:
@@ -407,54 +414,65 @@ class LCSClient:
 
     def _refresh(self) -> None:
         """Get a fresh access token via the long-lived refresh token (no password)."""
-        refresh_token = self._tokens.get("refresh_token")
-        if not refresh_token:
-            logger.warning("oauth_refresh_rejected reason=missing_refresh_token")
-            raise MissingConfiguration(
-                "No refresh token is configured. Run cosmolex-mcp-setup, then restart the MCP server."
-            )
-        if not (self._client_id and self._client_secret):
-            logger.warning("oauth_refresh_rejected reason=missing_app_credentials")
-            raise MissingConfiguration(
-                "COSMOLEX_CLIENT_ID and COSMOLEX_CLIENT_SECRET are required. "
-                "Run cosmolex-mcp-setup, then restart the MCP server."
-            )
-        try:
-            resp = requests.post(
-                TOKEN_URL,
-                data={
-                    "grant_type": "refresh_token",
-                    "client_id": self._client_id,
-                    "client_secret": self._client_secret,
-                    "refresh_token": refresh_token,
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=30,
-                allow_redirects=False,
-            )
-        except requests.RequestException:
-            raise TransportFailure(
-                "CosmoLex authorization request outcome is unknown. Check whether authorization completed before retrying."
-            ) from None
-        if not resp.ok:
-            logger.warning(
-                "oauth_refresh_rejected reason=upstream_error status=%s",
-                resp.status_code,
-            )
-            if resp.status_code == 403:
-                raise AuthorizationRejected(
-                    "CosmoLex access denied: the connected account lacks permission for this action (or the authorization expired; re-run cosmolex-mcp-setup if so)."
+        with _TOKEN_REFRESH_LOCK:
+            latest = _load_tokens()
+            if latest.get("access_token") and latest != self._tokens:
+                self._tokens = latest
+                if self._token_valid():
+                    return
+            refresh_token = self._tokens.get("refresh_token")
+            if not refresh_token:
+                logger.warning("oauth_refresh_rejected reason=missing_refresh_token")
+                raise MissingConfiguration(
+                    "No refresh token is configured. Run cosmolex-mcp-setup, then restart the MCP server."
                 )
-            if resp.status_code in (400, 401):
-                raise AuthorizationRejected(
-                    "CosmoLex authorization expired or was rejected. Re-run cosmolex-mcp-setup to reconnect."
+            if not (self._client_id and self._client_secret):
+                logger.warning("oauth_refresh_rejected reason=missing_app_credentials")
+                raise MissingConfiguration(
+                    "COSMOLEX_CLIENT_ID and COSMOLEX_CLIENT_SECRET are required. "
+                    "Run cosmolex-mcp-setup, then restart the MCP server."
                 )
-            raise self._http_failure(resp)
-        try:
-            self._tokens = _token_record(resp.json(), self._tokens)
-        except (requests.exceptions.JSONDecodeError, ValueError, TypeError, KeyError):
-            raise InvalidVendorResponse() from None
-        _save_tokens(self._tokens)
+            try:
+                resp = requests.post(
+                    TOKEN_URL,
+                    data={
+                        "grant_type": "refresh_token",
+                        "client_id": self._client_id,
+                        "client_secret": self._client_secret,
+                        "refresh_token": refresh_token,
+                    },
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    timeout=30,
+                    allow_redirects=False,
+                )
+            except requests.RequestException:
+                raise TransportFailure(
+                    "CosmoLex authorization request outcome is unknown. Check whether authorization completed before retrying."
+                ) from None
+            if not resp.ok:
+                logger.warning(
+                    "oauth_refresh_rejected reason=upstream_error status=%s",
+                    resp.status_code,
+                )
+                if resp.status_code == 403:
+                    raise AuthorizationRejected(
+                        "CosmoLex access denied: the connected account lacks permission for this action (or the authorization expired; re-run cosmolex-mcp-setup if so)."
+                    )
+                if resp.status_code in (400, 401):
+                    raise AuthorizationRejected(
+                        "CosmoLex authorization expired or was rejected. Re-run cosmolex-mcp-setup to reconnect."
+                    )
+                raise self._http_failure(resp)
+            try:
+                self._tokens = _token_record(resp.json(), self._tokens)
+            except (
+                requests.exceptions.JSONDecodeError,
+                ValueError,
+                TypeError,
+                KeyError,
+            ):
+                raise InvalidVendorResponse() from None
+            _save_tokens(self._tokens)
 
     def _headers(self) -> dict:
         return {

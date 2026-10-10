@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as distribution_version
 from typing import Annotated
 
@@ -176,7 +177,15 @@ def _expected_schema_shape(field: str, properties: dict) -> str:
 
 
 def _package_version() -> str:
-    return distribution_version("cosmolex-mcp")
+    try:
+        return distribution_version("cosmolex-mcp")
+    except PackageNotFoundError:
+        try:
+            from cosmolex_mcp import __version__ as pkg_version
+
+            return pkg_version
+        except ImportError:
+            return "0.0.0+local"
 
 
 mcp = SafeErrorMCPServer(
